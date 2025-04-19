@@ -624,6 +624,11 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ] && ! [[ " ${skip_stages} " =~ [
             fi
             utils/copy_data_dir.sh --validate_opts --non-print data/"${dset}" "${data_feats}${_suf}/${dset}"
             rm -f ${data_feats}${_suf}/${dset}/{segments,wav.scp,reco2file_and_channel,reco2dur}
+            
+            # Copy isdysfl file if it exists
+            if [ -f data/${dset}/isdysfl ]; then
+                cp data/${dset}/isdysfl ${data_feats}${_suf}/${dset}/
+            fi
 
             # Copy reference text files if there is more than 1 reference
             if [ ${#ref_text_files[@]} -gt 1 ]; then
@@ -670,6 +675,12 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ] && ! [[ " ${skip_stages} " =~ [
                 _suf=""
             fi
             utils/copy_data_dir.sh --validate_opts --non-print data/"${dset}" "${data_feats}${_suf}/${dset}"
+            
+            # Copy isdysfl file if it exists
+            if [ -f data/${dset}/isdysfl ]; then
+                cp data/${dset}/isdysfl ${data_feats}${_suf}/${dset}/
+            fi
+            
             if [ "${dset}" = "${train_set}" ] || [ "${dset}" = "${valid_set}" ]; then
                 _suf="/org"
 
@@ -713,6 +724,9 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ] && ! [[ " ${skip_stages} " =~ [
             fi
             # 1. Copy datadir
             utils/copy_data_dir.sh --validate_opts --non-print data/"${dset}" "${data_feats}${_suf}/${dset}"
+            if [ -f data/${dset}/isdysfl ]; then
+                cp data/${dset}/isdysfl ${data_feats}${_suf}/${dset}/
+            fi
 
             # Copy reference text files if there is more than 1 reference
             if [ ${#ref_text_files[@]} -gt 1 ]; then
@@ -763,6 +777,11 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ] && ! [[ " ${skip_stages} " =~ [
                 fi
             fi
             utils/copy_data_dir.sh --validate_opts --non-print data/"${dset}" "${data_feats}${_suf}/${dset}"
+            
+            # Copy isdysfl file if it exists
+            if [ -f data/${dset}/isdysfl ]; then
+                cp data/${dset}/isdysfl ${data_feats}${_suf}/${dset}/
+            fi
 
             # Copy reference text files if there is more than 1 reference
             # shellcheck disable=SC2068
@@ -1247,6 +1266,14 @@ if [ ${stage} -le 10 ] && [ ${stop_stage} -ge 10 ] && ! [[ " ${skip_stages} " =~
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/${ref_text_files[$i]},${ref_text_names[$i]},text "
     done
 
+    # 追加: isdysflデータの読み込み設定
+    if [ -f "${_asr_train_dir}/isdysfl" ]; then
+        _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/isdysfl,isdysfl,text_int "
+    fi
+    if [ -f "${_asr_valid_dir}/isdysfl" ]; then
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/isdysfl,isdysfl,text_int "
+    fi
+
     # shellcheck disable=SC2046,SC2086
     ${train_cmd} JOB=1:"${_nj}" "${_logdir}"/stats.JOB.log \
         ${python} -m espnet2.bin.${asr_task}_train \
@@ -1357,6 +1384,18 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
             _opts+="--train_data_path_and_name_and_type ${_split_dir}/${ref_text_files[$i]},${ref_text_names[$i]},text "
             _opts+="--train_shape_file ${_split_dir}/${ref_text_names[$i]}_shape.${token_type} "
         done
+        
+        # 追加: isdysflデータの読み込み設定（分割時）
+        if [ -f "${_asr_train_dir}/isdysfl" ]; then
+            # isdysflファイルも分割して使用する設定を追加
+            ${python} -m espnet2.bin.split_scps \
+              --scps \
+                  "${_asr_train_dir}/isdysfl" \
+              --num_splits "${num_splits_asr}" \
+              --output_dir "${_split_dir}/isdysfl_split"
+            _opts+="--train_data_path_and_name_and_type ${_split_dir}/isdysfl_split,isdysfl,text_int "
+        fi
+        
         _opts+="--multiple_iterator true "
 
     else
@@ -1376,6 +1415,11 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
             _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/${ref_text_files[$i]},${ref_text_names[$i]},text "
             _opts+="--train_shape_file ${asr_stats_dir}/train/${ref_text_names[$i]}_shape.${token_type} "
         done
+        
+        # 追加: isdysflデータの読み込み設定
+        if [ -f "${_asr_train_dir}/isdysfl" ]; then
+            _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/isdysfl,isdysfl,text_int "
+        fi
     fi
 
     # shellcheck disable=SC2068
@@ -1383,6 +1427,11 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/${ref_text_files[$i]},${ref_text_names[$i]},text "
         _opts+="--valid_shape_file ${asr_stats_dir}/valid/${ref_text_names[$i]}_shape.${token_type} "
     done
+    
+    # 追加: 検証用isdysflデータの読み込み設定
+    if [ -f "${_asr_valid_dir}/isdysfl" ]; then
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/isdysfl,isdysfl,text_int "
+    fi
 
     log "Generate '${asr_exp}/run.sh'. You can resume the process from stage 11 using this script"
     mkdir -p "${asr_exp}"; echo "${run_args} --stage 11 \"\$@\"; exit \$?" > "${asr_exp}/run.sh"; chmod +x "${asr_exp}/run.sh"
@@ -1419,8 +1468,8 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
             --ignore_init_mismatch ${ignore_init_mismatch} \
             --fold_length "${_fold_length}" \
             --output_dir "${asr_exp}" \
+            --allow_variable_data_keys true \
             ${_opts} ${asr_args}
-
 fi
 
 
