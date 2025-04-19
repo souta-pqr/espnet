@@ -13,7 +13,7 @@ test_sets="eval"
 asr_config=myconf/train_asr_cbs_transducer_120303_12blk.yaml
 inference_config=myconf/decode_cbs_transducer.yaml
 
-asr_tag=0414_hatuon_fid_subinfo
+asr_tag=0419_hatuon_fid_subinfo_multi
 
 lm_config=conf/train_lm.yaml
 use_lm=false
@@ -38,7 +38,9 @@ use_lm=false
     --train_set "${train_set}"                         \
     --valid_set "${valid_set}"                         \
     --test_sets "${test_sets}"                         \
-    --lm_train_text "data/${train_set}/text" "$@"
+    --lm_train_text "data/${train_set}/text"           \
+    --asr_args "--model espnet_dysfl --allow_variable_data_keys true" \
+    "$@"
 
 #    --audio_format wav                                 \
 #    --use_lm ${use_lm}                                 \
