@@ -33,11 +33,13 @@ decoder_conf:
 joint_net_conf:
     joint_space_size: 640
 
-# 
+
+model: espnet 
 model_conf:
     ctc_weight: 0.0
     report_cer: True
     report_wer: True
+    dysfl_weight: 0.1
 
 #
 frontend: default
@@ -46,12 +48,15 @@ frontend_conf:
 
 # minibatch related
 batch_type: folded
-batch_size: 12
+batch_size: 8 # 12 -> 8
 # valid_batch_size: 1
 # optimization related
 # batch_type: numel
 # # batch_bins:    4500000
 # batch_bins:    4000000
+
+# setting seed
+seed: 41 # お試し
 
 # optimization related
 # accum_grad: 1
