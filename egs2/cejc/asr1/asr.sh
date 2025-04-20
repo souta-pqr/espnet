@@ -867,9 +867,31 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ] && ! [[ " ${skip_stages} " =~ [
                 awk ' { if( NF != 1 ) print $0; } ' >"${data_feats}/${dset}/${ref_txt}"
         done
 
+        # Process isdysfl file if it exists
+        if [ -f "${data_feats}/org/${dset}/isdysfl" ]; then
+            # Filter isdysfl based on valid utterances
+            if [ "${_feats_type}" = raw ]; then
+                # When using raw features, filter by utt2num_samples
+                <"${data_feats}/org/${dset}/isdysfl" \
+                    utils/filter_scp.pl "${data_feats}/${dset}/utt2num_samples" \
+                    >"${data_feats}/${dset}/isdysfl.tmp"
+            else
+                # When using extracted features, filter by feats_shape
+                <"${data_feats}/org/${dset}/isdysfl" \
+                    utils/filter_scp.pl "${data_feats}/${dset}/feats_shape" \
+                    >"${data_feats}/${dset}/isdysfl.tmp"
+            fi
+            
+            # Check if each line has at least 2 fields (utterance ID and at least one label)
+            <"${data_feats}/${dset}/isdysfl.tmp" \
+                awk 'NF >= 2 {print $0}' >"${data_feats}/${dset}/isdysfl"
+            
+            rm "${data_feats}/${dset}/isdysfl.tmp"
+        fi
+
         # fix_data_dir.sh leaves only utts which exist in all files
         utils/fix_data_dir.sh \
-            ${ref_text_files_str:+--utt_extra_files "${ref_text_files_str}"} \
+            ${ref_text_files_str:+--utt_extra_files "${ref_text_files_str} isdysfl"} \
             "${data_feats}/${dset}"
     done
 
