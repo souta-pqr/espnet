@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import copy
 import logging
 import sys
 from distutils.version import LooseVersion
@@ -19,9 +18,7 @@ from espnet2.asr.decoder.hugging_face_transformers_decoder import (
 )
 from espnet2.asr.decoder.s4_decoder import S4Decoder
 from espnet2.asr.partially_AR_model import PartiallyARInference
-from espnet2.asr.transducer.beam_search_transducer import (
-    BeamSearchTransducer,
-)
+from espnet2.asr.transducer.beam_search_transducer import BeamSearchTransducer
 from espnet2.asr.transducer.beam_search_transducer import (
     ExtendedHypothesis as ExtTransHypothesis,
 )
@@ -49,6 +46,9 @@ from espnet.nets.scorers.ctc import CTCPrefixScorer
 from espnet.nets.scorers.length_bonus import LengthBonus
 from espnet.utils.cli_utils import get_commandline_args
 
+# 非流暢性の追加
+from espnet2.asr.espnet_dysfl_model import ESPnetASRDysflModel
+
 try:
     from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM
     from transformers.file_utils import ModelOutput
@@ -66,10 +66,6 @@ ListOfHypothesis = List[
         Union[Hypothesis, ExtTransHypothesis, TransHypothesis],
     ]
 ]
-
-logger = logging.getLogger(__name__)
-# NOTE(shikhar): We use contextual logging here because
-# RTF calculation looks for "INFO: " as a prefix in the logs.
 
 
 class Speech2Text:
@@ -163,7 +159,7 @@ class Speech2Text:
         asr_model.to(dtype=getattr(torch, dtype)).eval()
 
         if quantize_asr_model:
-            logger.info("Use quantized asr model for decoding.")
+            logging.info("Use quantized asr model for decoding.")
 
             asr_model = torch.quantization.quantize_dynamic(
                 asr_model, qconfig_spec=qconfig_spec, dtype=quantize_dtype
@@ -186,7 +182,7 @@ class Speech2Text:
             )
 
             if quantize_lm:
-                logger.info("Use quantized lm for decoding.")
+                logging.info("Use quantized lm for decoding.")
 
                 lm = torch.quantization.quantize_dynamic(
                     lm, qconfig_spec=qconfig_spec, dtype=quantize_dtype
@@ -251,27 +247,21 @@ class Speech2Text:
 
             if decoder.causal_lm:
                 hugging_face_model = AutoModelForCausalLM.from_pretrained(
-                    decoder.model_name_or_path, **decoder.overriding_architecture_config
+                    decoder.model_name_or_path
                 )
 
                 hugging_face_model.resize_token_embeddings(decoder.lm_head.out_features)
 
                 transformer = get_hugging_face_model_network(hugging_face_model)
                 transformer.load_state_dict(decoder.decoder.state_dict())
-                if decoder.separate_lm_head:
-                    lm_head = copy.deepcopy(
-                        get_hugging_face_model_lm_head(hugging_face_model)
-                    )
-                else:
-                    lm_head = get_hugging_face_model_lm_head(hugging_face_model)
+
+                lm_head = get_hugging_face_model_lm_head(hugging_face_model)
                 lm_head.load_state_dict(decoder.lm_head.state_dict())
             else:
                 hugging_face_model = AutoModelForSeq2SeqLM.from_pretrained(
-                    decoder.model_name_or_path, **decoder.overriding_architecture_config
+                    decoder.model_name_or_path
                 )
 
-                if decoder.separate_lm_head:
-                    hugging_face_model.lm_head = copy.deepcopy(decoder.lm_head)
                 hugging_face_model.lm_head.load_state_dict(decoder.lm_head.state_dict())
 
                 if hasattr(hugging_face_model, "model"):
@@ -343,7 +333,7 @@ class Speech2Text:
                     raise NotImplementedError(
                         "BeamSearchTimeSync with batching is not yet supported."
                     )
-                logger.info("BeamSearchTimeSync implementation is selected.")
+                logging.info("BeamSearchTimeSync implementation is selected.")
 
                 scorers["ctc"] = asr_model.ctc
                 beam_search = BeamSearchTimeSync(
@@ -377,14 +367,14 @@ class Speech2Text:
                         if streaming:
                             beam_search.__class__ = BatchBeamSearchOnlineSim
                             beam_search.set_streaming_config(asr_train_config)
-                            logger.info(
+                            logging.info(
                                 "BatchBeamSearchOnlineSim implementation is selected."
                             )
                         else:
                             beam_search.__class__ = BatchBeamSearch
-                            logger.info("BatchBeamSearch implementation is selected.")
+                            logging.info("BatchBeamSearch implementation is selected.")
                     else:
-                        logger.warning(
+                        logging.warning(
                             f"As non-batch scorers {non_batch} are found, "
                             f"fall back to non-batch implementation."
                         )
@@ -393,8 +383,8 @@ class Speech2Text:
             for scorer in scorers.values():
                 if isinstance(scorer, torch.nn.Module):
                     scorer.to(device=device, dtype=getattr(torch, dtype)).eval()
-            logger.info(f"Beam_search: {beam_search}")
-            logger.info(f"Decoding device={device}, dtype={dtype}")
+            logging.info(f"Beam_search: {beam_search}")
+            logging.info(f"Decoding device={device}, dtype={dtype}")
 
         # 5. [Optional] Build Text converter: e.g. bpe-sym -> Text
         if token_type is None:
@@ -472,7 +462,7 @@ class Speech2Text:
                 beam_search.set_hyp_primer(
                     list(converter.tokenizer.tokenizer.convert_tokens_to_ids(a1))
                 )
-        logger.info(f"Text tokenizer: {tokenizer}")
+        logging.info(f"Text tokenizer: {tokenizer}")
 
         self.asr_model = asr_model
         self.asr_train_args = asr_train_args
@@ -504,7 +494,7 @@ class Speech2Text:
         """Inference
 
         Args:
-            data: Input speech data
+            speech: Input speech data
         Returns:
             text, token, token_int, hyp
 
@@ -519,7 +509,7 @@ class Speech2Text:
         # lengths: (1,)
         lengths = speech.new_full([1], dtype=torch.long, fill_value=speech.size(1))
         batch = {"speech": speech, "speech_lengths": lengths}
-        logger.info("speech length: " + str(speech.size(1)))
+        logging.info("speech length: " + str(speech.size(1)))
 
         # a. To device
         batch = to_device(batch, device=self.device)
@@ -544,7 +534,11 @@ class Speech2Text:
                 assert len(enc_spk) == 1, len(enc_spk)
 
                 # c. Passed the encoder result and the beam search
-                ret = self._decode_single_sample(enc_spk[0])
+                if hasattr(self, "_decode_single_sample_with_dysfl") and isinstance(self.asr_model, ESPnetASRDysflModel):
+                    logging.info("非流暢性検出と一緒にデコードします")
+                    ret = self._decode_single_sample_with_dysfl(enc_spk[0], speech, lengths)
+                else:
+                    ret = self._decode_single_sample(enc_spk[0])
                 results.append(ret)
 
         else:
@@ -556,7 +550,11 @@ class Speech2Text:
             assert len(enc) == 1, len(enc)
 
             # c. Passed the encoder result and the beam search
-            results = self._decode_single_sample(enc[0])
+            if hasattr(self, "_decode_single_sample_with_dysfl") and isinstance(self.asr_model, ESPnetASRDysflModel):
+                logging.info("非流暢性検出と一緒にデコードします")
+                results = self._decode_single_sample_with_dysfl(enc[0], speech, lengths)
+            else:
+                results = self._decode_single_sample(enc[0])
 
             # Encoder intermediate CTC predictions
             if intermediate_outs is not None:
@@ -564,6 +562,111 @@ class Speech2Text:
                 results = (results, encoder_interctc_res)
 
         return results
+
+    def _decode_single_sample_with_dysfl(self, enc: torch.Tensor, speech: torch.Tensor, lengths: torch.Tensor) -> List:
+        """非流暢性検出付きのデコード処理"""
+        # 通常のデコードでnbest_hypsを取得
+        logging.info("非流暢性検出付きデコード処理を開始")
+        nbest_hyps = self._decode_single_sample(enc)
+        
+        try:
+            # ASR結果から対応するテキストとその長さを取得
+            text_tensors = []
+            text_lengths = []
+            
+            for hyp in nbest_hyps:
+                if isinstance(hyp, (Hypothesis, TransHypothesis, ExtTransHypothesis)):
+                    if isinstance(hyp.yseq, list):
+                        token_ids = hyp.yseq[1:] if len(hyp.yseq) <= 2 else hyp.yseq[1:-1]
+                    else:
+                        token_ids = hyp.yseq[1:].tolist() if hyp.yseq.size(0) <= 2 else hyp.yseq[1:-1].tolist()
+                    text_tensors.append(torch.tensor(token_ids, device=enc.device))
+                    text_lengths.append(len(token_ids))
+            
+            # テキストがある場合のみ予測処理
+            dysfl_probs_list = []
+            dysfl_preds_list = []
+            
+            if text_tensors:
+                # バッチ処理のためにパディング
+                max_len = max(text_lengths) if text_lengths else 0
+                padded_text = []
+                for tensor in text_tensors:
+                    if len(tensor) < max_len:
+                        padding = torch.full((max_len - len(tensor),), self.asr_model.ignore_id, 
+                                            dtype=tensor.dtype, device=tensor.device)
+                        padded_text.append(torch.cat([tensor, padding]))
+                    else:
+                        padded_text.append(tensor)
+                
+                if padded_text:
+                    padded_text = torch.stack(padded_text)
+                    text_lengths = torch.tensor(text_lengths, device=enc.device)
+                    
+                    logging.info(f"非流暢性予測の入力: text={padded_text.shape}, lengths={text_lengths.shape}")
+                    
+                    # 非流暢性予測
+                    dysfl_probs, dysfl_preds = self.asr_model.predict_dysfl(
+                        speech,
+                        lengths,
+                        padded_text,
+                        text_lengths
+                    )
+                    
+                    # 結果をリストに変換
+                    for i, length in enumerate(text_lengths):
+                        dysfl_probs_list.append(dysfl_probs[i, :length])
+                        dysfl_preds_list.append(dysfl_preds[i, :length])
+                        logging.info(f"非流暢性予測結果 {i}: probs={dysfl_probs_list[-1].shape}, preds={dysfl_preds_list[-1].shape}")
+                else:
+                    logging.warning("非流暢性予測をスキップ: パディングテキストが空です")
+                    for _ in range(len(nbest_hyps)):
+                        dysfl_probs_list.append(None)
+                        dysfl_preds_list.append(None)
+            else:
+                logging.warning("非流暢性予測をスキップ: テキストがありません")
+                for _ in range(len(nbest_hyps)):
+                    dysfl_probs_list.append(None)
+                    dysfl_preds_list.append(None)
+                    
+            # 結果を拡張して非流暢性検出結果も含める
+            extended_results = []
+            for i, (hyp, probs, preds) in enumerate(zip(nbest_hyps, dysfl_probs_list, dysfl_preds_list)):
+                # 通常の結果を取得
+                if isinstance(hyp, (Hypothesis, TransHypothesis, ExtTransHypothesis)):
+                    # remove sos/eos and get results
+                    last_pos = None if self.asr_model.use_transducer_decoder else -1
+                    if isinstance(hyp.yseq, list):
+                        token_int = hyp.yseq[1:last_pos]
+                    else:
+                        token_int = hyp.yseq[1:last_pos].tolist()
+
+                    # remove blank symbol id, which is assumed to be 0
+                    token_int = list(filter(lambda x: x != 0, token_int))
+
+                    # Change integer-ids to tokens
+                    token = self.converter.ids2tokens(token_int)
+
+                    if self.tokenizer is not None:
+                        text = self.tokenizer.tokens2text(token)
+                    else:
+                        text = None
+                        
+                    # 非流暢性結果を含めた拡張結果
+                    extended_results.append((text, token, token_int, hyp, probs, preds))
+                    logging.info(f"拡張結果 {i}: text={text}, probs有={probs is not None}, preds有={preds is not None}")
+                else:
+                    # 元の形式をそのまま保持
+                    extended_results.append(hyp)
+                    
+            return extended_results
+        except Exception as e:
+            logging.error(f"非流暢性予測中にエラーが発生しました: {str(e)}")
+            import traceback
+            logging.error(traceback.format_exc())
+            
+            # エラーが発生した場合は通常の結果を返す
+            return nbest_hyps
 
     @typechecked
     def _decode_interctc(
@@ -848,13 +951,14 @@ def inference(
             assert len(keys) == _bs, f"{len(keys)} != {_bs}"
             batch = {k: v[0] for k, v in batch.items() if not k.endswith("_lengths")}
 
-            # N-best list of (text, token, token_int, hyp_object)
+            # N-best list of (text, token, token_int, hyp_object, dysfl_probs, dysfl_preds)
             try:
                 results = speech2text(**batch)
             except TooShortUttError as e:
                 logging.warning(f"Utterance {keys} {e}")
                 hyp = Hypothesis(score=0.0, scores={}, states={}, yseq=[])
-                results = [[" ", ["<space>"], [2], hyp]] * nbest
+                # 非流暢性値はNoneとして追加
+                results = [[" ", ["<space>"], [2], hyp, None, None]] * nbest
                 if enh_s2t_task:
                     num_spk = getattr(speech2text.asr_model.enh_model, "num_spk", 1)
                     results = [results for _ in range(num_spk)]
@@ -864,9 +968,14 @@ def inference(
             if enh_s2t_task or multi_asr:
                 # Enh+ASR joint task
                 for spk, ret in enumerate(results, 1):
-                    for n, (text, token, token_int, hyp) in zip(
-                        range(1, nbest + 1), ret
-                    ):
+                    for n, result in zip(range(1, nbest + 1), ret):
+                        # 非流暢性検出結果に対応
+                        if len(result) >= 6:  # 非流暢性検出結果がある場合
+                            text, token, token_int, hyp, dysfl_probs, dysfl_preds = result
+                        else:  # 旧形式の場合
+                            text, token, token_int, hyp = result
+                            dysfl_probs, dysfl_preds = None, None
+                        
                         # Create a directory: outdir/{n}best_recog_spk?
                         ibest_writer = writer[f"{n}best_recog"]
 
@@ -879,6 +988,16 @@ def inference(
 
                         if text is not None:
                             ibest_writer[f"text_spk{spk}"][key] = text
+                            
+                        # 非流暢性検出結果があれば保存
+                        if dysfl_probs is not None:
+                            ibest_writer[f"dysfl_probs_spk{spk}"][key] = " ".join(
+                                [f"{p.item():.6f}" for p in dysfl_probs]
+                            )
+                        if dysfl_preds is not None:
+                            ibest_writer[f"dysfl_preds_spk{spk}"][key] = " ".join(
+                                [f"{int(p.item())}" for p in dysfl_preds]
+                            )
 
             else:
                 # Normal ASR
@@ -886,9 +1005,14 @@ def inference(
                 if isinstance(results, tuple):
                     results, encoder_interctc_res = results
 
-                for n, (text, token, token_int, hyp) in zip(
-                    range(1, nbest + 1), results
-                ):
+                for n, result in zip(range(1, nbest + 1), results):
+                    # 非流暢性検出結果に対応
+                    if len(result) >= 6:  # 非流暢性検出結果がある場合
+                        text, token, token_int, hyp, dysfl_probs, dysfl_preds = result
+                    else:  # 旧形式の場合
+                        text, token, token_int, hyp = result
+                        dysfl_probs, dysfl_preds = None, None
+                        
                     # Create a directory: outdir/{n}best_recog
                     ibest_writer = writer[f"{n}best_recog"]
 
@@ -899,6 +1023,16 @@ def inference(
 
                     if text is not None:
                         ibest_writer["text"][key] = text
+                        
+                    # 非流暢性検出結果があれば保存
+                    if dysfl_probs is not None:
+                        ibest_writer["dysfl_probs"][key] = " ".join(
+                            [f"{p.item():.6f}" for p in dysfl_probs]
+                        )
+                    if dysfl_preds is not None:
+                        ibest_writer["dysfl_preds"][key] = " ".join(
+                            [f"{int(p.item())}" for p in dysfl_preds]
+                        )
 
                 # Write intermediate predictions to
                 # encoder_interctc_layer<layer_idx>.txt
@@ -908,7 +1042,6 @@ def inference(
                         ibest_writer[f"encoder_interctc_layer{idx}.txt"][key] = (
                             " ".join(text)
                         )
-
 
 def get_parser():
     parser = config_argparse.ArgumentParser(
