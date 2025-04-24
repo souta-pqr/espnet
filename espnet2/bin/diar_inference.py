@@ -1,358 +1,795 @@
 #!/usr/bin/env python3
-
 import argparse
 import logging
 import sys
-from itertools import permutations
+from distutils.version import LooseVersion
+from itertools import groupby
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from tqdm import trange
+import torch.quantization
 from typeguard import typechecked
 
-from espnet2.enh.loss.criterions.tf_domain import FrequencyDomainMSE
-from espnet2.enh.loss.criterions.time_domain import SISNRLoss
-from espnet2.enh.loss.wrappers.pit_solver import PITSolver
-from espnet2.fileio.npy_scp import NpyScpWriter
-from espnet2.fileio.sound_scp import SoundScpWriter
-from espnet2.tasks.diar import DiarizationTask
+from espnet2.asr.decoder.hugging_face_transformers_decoder import (
+    get_hugging_face_model_lm_head,
+    get_hugging_face_model_network,
+)
+from espnet2.asr.decoder.s4_decoder import S4Decoder
+from espnet2.asr.partially_AR_model import PartiallyARInference
+from espnet2.asr.transducer.beam_search_transducer import BeamSearchTransducer
+from espnet2.asr.transducer.beam_search_transducer import (
+    ExtendedHypothesis as ExtTransHypothesis,
+)
+from espnet2.asr.transducer.beam_search_transducer import Hypothesis as TransHypothesis
+from espnet2.fileio.datadir_writer import DatadirWriter
+from espnet2.tasks.asr import ASRTask
 from espnet2.tasks.enh_s2t import EnhS2TTask
+from espnet2.tasks.lm import LMTask
+from espnet2.text.build_tokenizer import build_tokenizer
+from espnet2.text.hugging_face_token_id_converter import HuggingFaceTokenIDConverter
+from espnet2.text.token_id_converter import TokenIDConverter
+from espnet2.text.whisper_token_id_converter import OpenAIWhisperTokenIDConverter
 from espnet2.torch_utils.device_funcs import to_device
 from espnet2.torch_utils.set_all_random_seed import set_all_random_seed
 from espnet2.utils import config_argparse
-from espnet2.utils.types import (
-    humanfriendly_parse_size_or_none,
-    int_or_none,
-    str2bool,
-    str2triple_str,
-    str_or_none,
-)
+from espnet2.utils.nested_dict_action import NestedDictAction
+from espnet2.utils.types import str2bool, str2triple_str, str_or_none
+from espnet.nets.batch_beam_search import BatchBeamSearch
+from espnet.nets.batch_beam_search_online_sim import BatchBeamSearchOnlineSim
+from espnet.nets.beam_search import BeamSearch, Hypothesis
+from espnet.nets.beam_search_timesync import BeamSearchTimeSync
+from espnet.nets.pytorch_backend.transformer.subsampling import TooShortUttError
+from espnet.nets.scorer_interface import BatchScorerInterface
+from espnet.nets.scorers.ctc import CTCPrefixScorer
+from espnet.nets.scorers.length_bonus import LengthBonus
 from espnet.utils.cli_utils import get_commandline_args
 
+# 非流暢性の追加
+from espnet2.asr.espnet_dysfl_model import ESPnetASRDysflModel
 
-class DiarizeSpeech:
-    """DiarizeSpeech class
+try:
+    from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM
+    from transformers.file_utils import ModelOutput
+
+    is_transformers_available = True
+except ImportError:
+    is_transformers_available = False
+
+# Alias for typing
+ListOfHypothesis = List[
+    Tuple[
+        Optional[str],
+        List[str],
+        List[int],
+        Union[Hypothesis, ExtTransHypothesis, TransHypothesis],
+    ]
+]
+
+
+class Speech2Text:
+    """Speech2Text class
 
     Examples:
         >>> import soundfile
-        >>> diarization = DiarizeSpeech("diar_config.yaml", "diar.pth")
+        >>> speech2text = Speech2Text("asr_config.yml", "asr.pth")
         >>> audio, rate = soundfile.read("speech.wav")
-        >>> diarization(audio)
-        [(spk_id, start, end), (spk_id2, start2, end2)]
+        >>> speech2text(audio)
+        [(text, token, token_int, hypothesis object), ...]
 
     """
 
     @typechecked
     def __init__(
         self,
-        train_config: Union[Path, str, None] = None,
-        model_file: Union[Path, str, None] = None,
-        segment_size: Optional[float] = None,
-        hop_size: Optional[float] = None,
-        normalize_segment_scale: bool = False,
-        show_progressbar: bool = False,
-        normalize_output_wav: bool = False,
-        num_spk: Optional[int] = None,
+        asr_train_config: Union[Path, str, None] = None,
+        asr_model_file: Union[Path, str, None] = None,
+        transducer_conf: Optional[Dict] = None,
+        lm_train_config: Union[Path, str, None] = None,
+        lm_file: Union[Path, str, None] = None,
+        ngram_scorer: str = "full",
+        ngram_file: Union[Path, str, None] = None,
+        token_type: Optional[str] = None,
+        bpemodel: Optional[str] = None,
         device: str = "cpu",
+        maxlenratio: float = 0.0,
+        minlenratio: float = 0.0,
+        batch_size: int = 1,
         dtype: str = "float32",
+        beam_size: int = 20,
+        ctc_weight: float = 0.5,
+        lm_weight: float = 1.0,
+        ngram_weight: float = 0.9,
+        penalty: float = 0.0,
+        nbest: int = 1,
+        normalize_length: bool = False,
+        streaming: bool = False,
         enh_s2t_task: bool = False,
-        multiply_diar_result: bool = False,
+        quantize_asr_model: bool = False,
+        quantize_lm: bool = False,
+        quantize_modules: List[str] = ["Linear"],
+        quantize_dtype: str = "qint8",
+        hugging_face_decoder: bool = False,
+        hugging_face_decoder_conf: Dict[str, Any] = {},
+        time_sync: bool = False,
+        multi_asr: bool = False,
+        lid_prompt: bool = False,
+        lang_prompt_token: Optional[str] = None,
+        nlp_prompt_token: Optional[str] = None,
+        prompt_token_file: Optional[str] = None,
+        partial_ar: bool = False,
+        threshold_probability: float = 0.99,
+        max_seq_len: int = 5,
+        max_mask_parallel: int = -1,
     ):
 
-        task = DiarizationTask if not enh_s2t_task else EnhS2TTask
+        task = ASRTask if not enh_s2t_task else EnhS2TTask
 
-        # 1. Build Diar model
-        diar_model, diar_train_args = task.build_model_from_file(
-            train_config, model_file, device
+        if quantize_asr_model or quantize_lm:
+            if quantize_dtype == "float16" and torch.__version__ < LooseVersion(
+                "1.5.0"
+            ):
+                raise ValueError(
+                    "float16 dtype for dynamic quantization is not supported with "
+                    "torch version < 1.5.0. Switch to qint8 dtype instead."
+                )
+
+        qconfig_spec = set([getattr(torch.nn, q) for q in quantize_modules])
+        quantize_dtype: torch.dtype = getattr(torch, quantize_dtype)
+
+        # 1. Build ASR model
+        scorers = {}
+        asr_model, asr_train_args = task.build_model_from_file(
+            asr_train_config, asr_model_file, device
         )
+
         if enh_s2t_task:
-            diar_model.inherite_attributes(
+            asr_model.inherite_attributes(
                 inherite_s2t_attrs=[
+                    "ctc",
                     "decoder",
-                    "attractor",
-                ],
-                inherite_enh_attrs=[
-                    "mask_module",
-                ],
+                    "eos",
+                    "joint_network",
+                    "sos",
+                    "token_list",
+                    "use_transducer_decoder",
+                ]
+            )
+        asr_model.to(dtype=getattr(torch, dtype)).eval()
+
+        if quantize_asr_model:
+            logging.info("Use quantized asr model for decoding.")
+
+            asr_model = torch.quantization.quantize_dynamic(
+                asr_model, qconfig_spec=qconfig_spec, dtype=quantize_dtype
             )
 
-        diar_model.to(dtype=getattr(torch, dtype)).eval()
+        decoder = asr_model.decoder
 
-        self.device = device
-        self.dtype = dtype
-        self.diar_train_args = diar_train_args
-        self.diar_model = diar_model
-
-        # only used when processing long speech, i.e.
-        # segment_size is not None and hop_size is not None
-        self.segment_size = segment_size
-        self.hop_size = hop_size
-        self.normalize_segment_scale = normalize_segment_scale
-        self.normalize_output_wav = normalize_output_wav
-        self.show_progressbar = show_progressbar
-        # not specifying "num_spk" in inference config file
-        # will enable speaker number prediction during inference
-        self.num_spk = num_spk
-
-        # multiply_diar_result corresponds to the "Post-processing"
-        # in https://arxiv.org/pdf/2203.17068.pdf
-        self.multiply_diar_result = multiply_diar_result
-        self.enh_s2t_task = enh_s2t_task
-
-        self.segmenting_diar = segment_size is not None and not enh_s2t_task
-        self.segmenting_enh_diar = (
-            segment_size is not None and hop_size is not None and enh_s2t_task
+        ctc = CTCPrefixScorer(ctc=asr_model.ctc, eos=asr_model.eos)
+        token_list = asr_model.token_list
+        scorers.update(
+            decoder=decoder,
+            ctc=ctc,
+            length_bonus=LengthBonus(len(token_list)),
         )
-        if self.segmenting_diar:
-            logging.info("Perform segment-wise speaker diarization")
-            logging.info("Segment length = {} sec".format(segment_size))
-        elif self.segmenting_enh_diar:
-            logging.info("Perform segment-wise speech separation and diarization")
-            logging.info(
-                "Segment length = {} sec, hop length = {} sec".format(
-                    segment_size, hop_size
+
+        # 2. Build Language model
+        if lm_train_config is not None:
+            lm, lm_train_args = LMTask.build_model_from_file(
+                lm_train_config, lm_file, device
+            )
+
+            if quantize_lm:
+                logging.info("Use quantized lm for decoding.")
+
+                lm = torch.quantization.quantize_dynamic(
+                    lm, qconfig_spec=qconfig_spec, dtype=quantize_dtype
                 )
+
+            scorers["lm"] = lm.lm
+
+        # 3. Build ngram model
+        if ngram_file is not None:
+            if ngram_scorer == "full":
+                from espnet.nets.scorers.ngram import NgramFullScorer
+
+                ngram = NgramFullScorer(ngram_file, token_list)
+            else:
+                from espnet.nets.scorers.ngram import NgramPartScorer
+
+                ngram = NgramPartScorer(ngram_file, token_list)
+        else:
+            ngram = None
+        scorers["ngram"] = ngram
+
+        # 4. Build BeamSearch object
+        if asr_model.use_transducer_decoder:
+            # In multi-blank RNNT, we assume all big blanks are
+            # just before the standard blank in token_list
+            multi_blank_durations = getattr(
+                asr_model, "transducer_multi_blank_durations", []
+            )[::-1] + [1]
+            multi_blank_indices = [
+                asr_model.blank_id - i + 1
+                for i in range(len(multi_blank_durations), 0, -1)
+            ]
+
+            if transducer_conf is None:
+                transducer_conf = {}
+
+            beam_search_transducer = BeamSearchTransducer(
+                decoder=asr_model.decoder,
+                joint_network=asr_model.joint_network,
+                beam_size=beam_size,
+                lm=scorers["lm"] if "lm" in scorers else None,
+                lm_weight=lm_weight,
+                multi_blank_durations=multi_blank_durations,
+                multi_blank_indices=multi_blank_indices,
+                token_list=token_list,
+                **transducer_conf,
+            )
+            beam_search = None
+            hugging_face_model = None
+            hugging_face_linear_in = None
+        elif (
+            decoder.__class__.__name__ == "HuggingFaceTransformersDecoder"
+            and hugging_face_decoder
+        ):
+            if not is_transformers_available:
+                raise ImportError(
+                    "`transformers` is not available."
+                    " Please install it via `pip install transformers`"
+                    " or `cd /path/to/espnet/tools && . ./activate_python.sh"
+                    " && ./installers/install_transformers.sh`."
+                )
+
+            if decoder.causal_lm:
+                hugging_face_model = AutoModelForCausalLM.from_pretrained(
+                    decoder.model_name_or_path
+                )
+
+                hugging_face_model.resize_token_embeddings(decoder.lm_head.out_features)
+
+                transformer = get_hugging_face_model_network(hugging_face_model)
+                transformer.load_state_dict(decoder.decoder.state_dict())
+
+                lm_head = get_hugging_face_model_lm_head(hugging_face_model)
+                lm_head.load_state_dict(decoder.lm_head.state_dict())
+            else:
+                hugging_face_model = AutoModelForSeq2SeqLM.from_pretrained(
+                    decoder.model_name_or_path
+                )
+
+                hugging_face_model.lm_head.load_state_dict(decoder.lm_head.state_dict())
+
+                if hasattr(hugging_face_model, "model"):
+                    hugging_face_model.model.decoder.load_state_dict(
+                        decoder.decoder.state_dict()
+                    )
+                    del hugging_face_model.model.encoder
+                else:
+                    hugging_face_model.decoder.load_state_dict(
+                        decoder.decoder.state_dict()
+                    )
+                    del hugging_face_model.encoder
+
+            del asr_model.decoder.lm_head
+            del asr_model.decoder.decoder
+
+            hugging_face_linear_in = decoder.linear_in
+            hugging_face_model.to(device=device).eval()
+
+            if "num_beams" not in hugging_face_decoder_conf:
+                hugging_face_decoder_conf["num_beams"] = (
+                    hugging_face_model.config.num_beams
+                )
+
+            if (
+                hugging_face_model.config.pad_token_id is None
+                and "pad_token_id" not in hugging_face_decoder_conf
+            ):
+                hugging_face_decoder_conf["pad_token_id"] = (
+                    hugging_face_model.config.eos_token_id
+                )
+
+            beam_search = None
+            beam_search_transducer = None
+        else:
+            beam_search_transducer = None
+            hugging_face_model = None
+            hugging_face_linear_in = None
+
+            weights = dict(
+                decoder=1.0 - ctc_weight,
+                ctc=ctc_weight,
+                lm=lm_weight,
+                ngram=ngram_weight,
+                length_bonus=penalty,
+            )
+
+            if partial_ar:
+                beam_search = PartiallyARInference(
+                    asr_model.ctc,
+                    asr_model.decoder,
+                    threshold_probability=threshold_probability,
+                    sos=asr_model.sos,
+                    eos=asr_model.eos,
+                    mask_token=len(token_list),
+                    token_list=token_list,
+                    scorers=scorers,
+                    weights=weights,
+                    beam_size=beam_size,
+                    max_seq_len=max_seq_len,
+                    max_mask_parallel=max_mask_parallel,
+                )
+            elif time_sync:
+                if not hasattr(asr_model, "ctc"):
+                    raise NotImplementedError(
+                        "BeamSearchTimeSync without CTC is not supported."
+                    )
+                if batch_size != 1:
+                    raise NotImplementedError(
+                        "BeamSearchTimeSync with batching is not yet supported."
+                    )
+                logging.info("BeamSearchTimeSync implementation is selected.")
+
+                scorers["ctc"] = asr_model.ctc
+                beam_search = BeamSearchTimeSync(
+                    beam_size=beam_size,
+                    weights=weights,
+                    scorers=scorers,
+                    sos=asr_model.sos,
+                    token_list=token_list,
+                )
+            else:
+                beam_search = BeamSearch(
+                    beam_size=beam_size,
+                    weights=weights,
+                    scorers=scorers,
+                    sos=asr_model.sos,
+                    eos=asr_model.eos,
+                    vocab_size=len(token_list),
+                    token_list=token_list,
+                    pre_beam_score_key=None if ctc_weight == 1.0 else "full",
+                    normalize_length=normalize_length,
+                )
+
+                # TODO(karita): make all scorers batchfied
+                if batch_size == 1:
+                    non_batch = [
+                        k
+                        for k, v in beam_search.full_scorers.items()
+                        if not isinstance(v, BatchScorerInterface)
+                    ]
+                    if len(non_batch) == 0:
+                        if streaming:
+                            beam_search.__class__ = BatchBeamSearchOnlineSim
+                            beam_search.set_streaming_config(asr_train_config)
+                            logging.info(
+                                "BatchBeamSearchOnlineSim implementation is selected."
+                            )
+                        else:
+                            beam_search.__class__ = BatchBeamSearch
+                            logging.info("BatchBeamSearch implementation is selected.")
+                    else:
+                        logging.warning(
+                            f"As non-batch scorers {non_batch} are found, "
+                            f"fall back to non-batch implementation."
+                        )
+
+            beam_search.to(device=device, dtype=getattr(torch, dtype)).eval()
+            for scorer in scorers.values():
+                if isinstance(scorer, torch.nn.Module):
+                    scorer.to(device=device, dtype=getattr(torch, dtype)).eval()
+            logging.info(f"Beam_search: {beam_search}")
+            logging.info(f"Decoding device={device}, dtype={dtype}")
+
+        # 5. [Optional] Build Text converter: e.g. bpe-sym -> Text
+        if token_type is None:
+            token_type = asr_train_args.token_type
+        if bpemodel is None:
+            bpemodel = asr_train_args.bpemodel
+
+        # compatibility for whisper tokenizer
+        preprocessor_conf = getattr(asr_train_args, "preprocessor_conf", {})
+        whisper_language = preprocessor_conf.get("whisper_language", None)
+        whisper_task = preprocessor_conf.get("whisper_task", None)
+
+        if token_type is None:
+            tokenizer = None
+        elif token_type == "bpe" or token_type == "hugging_face":
+            if bpemodel is not None:
+                tokenizer = build_tokenizer(
+                    token_type=token_type,
+                    bpemodel=bpemodel,
+                )
+            else:
+                tokenizer = None
+        elif "whisper" in token_type:
+            tokenizer = build_tokenizer(
+                token_type=token_type,
+                bpemodel=bpemodel,
+                whisper_language=whisper_language,
+                whisper_task=whisper_task,
+                non_linguistic_symbols=prompt_token_file,
             )
         else:
-            logging.info("Perform direct speaker diarization on the input")
+            tokenizer = build_tokenizer(token_type=token_type)
+
+        if token_type == "hugging_face":
+            converter = HuggingFaceTokenIDConverter(model_name_or_path=bpemodel)
+        elif bpemodel not in ["whisper_en", "whisper_multilingual"]:
+            converter = TokenIDConverter(token_list=token_list)
+        else:
+            if "speaker_change_symbol" in preprocessor_conf:
+                sot_asr = True
+            else:
+                sot_asr = False
+            converter = OpenAIWhisperTokenIDConverter(
+                model_type=bpemodel,
+                added_tokens_txt=prompt_token_file,
+                language=whisper_language or "en",
+                task=whisper_task or "transcribe",
+                sot=sot_asr,
+            )
+            beam_search.set_hyp_primer(
+                list(converter.tokenizer.sot_sequence_including_notimestamps)
+            )
+            if lang_prompt_token is not None:
+                a1 = converter.tokenizer.tokenizer.convert_ids_to_tokens(
+                    converter.tokenizer.sot_sequence_including_notimestamps
+                )
+                a1 = a1[:1] + lang_prompt_token.split() + a1[3:]
+                beam_search.set_hyp_primer(
+                    list(converter.tokenizer.tokenizer.convert_tokens_to_ids(a1))
+                )
+            elif nlp_prompt_token is not None:
+                a1 = converter.tokenizer.tokenizer.convert_ids_to_tokens(
+                    converter.tokenizer.sot_sequence_including_notimestamps
+                )
+                prompt_tokens = tokenizer.text2tokens(nlp_prompt_token)
+                a1 = a1[:2] + prompt_tokens + a1[3:]
+                beam_search.set_hyp_primer(
+                    list(converter.tokenizer.tokenizer.convert_tokens_to_ids(a1))
+                )
+            elif lid_prompt:
+                a1 = converter.tokenizer.tokenizer.convert_ids_to_tokens(
+                    converter.tokenizer.sot_sequence_including_notimestamps
+                )
+                a1 = a1[:1]
+                beam_search.set_hyp_primer(
+                    list(converter.tokenizer.tokenizer.convert_tokens_to_ids(a1))
+                )
+        logging.info(f"Text tokenizer: {tokenizer}")
+
+        self.asr_model = asr_model
+        self.asr_train_args = asr_train_args
+        self.converter = converter
+        self.tokenizer = tokenizer
+        self.beam_search = beam_search
+        self.beam_search_transducer = beam_search_transducer
+        self.hugging_face_model = hugging_face_model
+        self.hugging_face_linear_in = hugging_face_linear_in
+        self.hugging_face_decoder_conf = hugging_face_decoder_conf
+        self.maxlenratio = maxlenratio
+        self.minlenratio = minlenratio
+        self.device = device
+        self.dtype = dtype
+        self.nbest = nbest
+        self.enh_s2t_task = enh_s2t_task
+        self.multi_asr = multi_asr
 
     @torch.no_grad()
     @typechecked
-    def __call__(
-        self, speech: Union[torch.Tensor, np.ndarray], fs: int = 8000
-    ) -> Union[List[torch.Tensor], Tuple]:
+    def __call__(self, speech: Union[torch.Tensor, np.ndarray]) -> Union[
+        ListOfHypothesis,
+        List[ListOfHypothesis],
+        Tuple[
+            ListOfHypothesis,
+            Union[Dict[int, List[str]], None],
+        ],
+    ]:
         """Inference
 
         Args:
-            speech: Input speech data (Batch, Nsamples [, Channels])
-            fs: sample rate
+            speech: Input speech data
         Returns:
-            [speaker_info1, speaker_info2, ...]
+            text, token, token_int, hyp
 
         """
 
         # Input as audio signal
         if isinstance(speech, np.ndarray):
-            speech = torch.as_tensor(speech)
+            speech = torch.tensor(speech)
 
-        assert speech.dim() > 1, speech.size()
-        batch_size = speech.size(0)
-        speech = speech.to(getattr(torch, self.dtype))
-        # lengths: (B,)
-        lengths = speech.new_full(
-            [batch_size], dtype=torch.long, fill_value=speech.size(1)
-        )
+        # data: (Nsamples,) -> (1, Nsamples)
+        speech = speech.unsqueeze(0).to(getattr(torch, self.dtype))
+        # lengths: (1,)
+        lengths = speech.new_full([1], dtype=torch.long, fill_value=speech.size(1))
+        batch = {"speech": speech, "speech_lengths": lengths}
+        logging.info("speech length: " + str(speech.size(1)))
 
         # a. To device
-        speech = to_device(speech, device=self.device)
-        lengths = to_device(lengths, device=self.device)
+        batch = to_device(batch, device=self.device)
 
-        if self.segmenting_diar and lengths[0] > self.segment_size * fs:
-            # Segment-wise speaker diarization
-            # Note that the segments are processed independently for now
-            # i.e., no speaker tracing is performed
-            num_segments = int(np.ceil(speech.size(1) / (self.segment_size * fs)))
-            t = T = int(self.segment_size * fs)
-            pad_shape = speech[:, :T].shape
-            diarized_wavs = []
-            range_ = trange if self.show_progressbar else range
-            for i in range_(num_segments):
-                st = int(i * self.segment_size * fs)
-                en = st + T
-                if en >= lengths[0]:
-                    # en - st < T (last segment)
-                    en = lengths[0]
-                    speech_seg = speech.new_zeros(pad_shape)
-                    t = en - st
-                    speech_seg[:, :t] = speech[:, st:en]
-                else:
-                    t = T
-                    speech_seg = speech[:, st:en]  # B x T [x C]
-
-                lengths_seg = speech.new_full(
-                    [batch_size], dtype=torch.long, fill_value=T
-                )
-                # b. Diarization Forward
-                encoder_out, encoder_out_lens = self.encode(
-                    speech_seg,
-                    lengths_seg,
-                )
-                spk_prediction, _ = self.decode(encoder_out, encoder_out_lens)
-                # List[torch.Tensor(B, T, num_spks)]
-                diarized_wavs.append(spk_prediction)
-            # Determine maximum estimated number of speakers among the segments
-            max_len = max([x.size(2) for x in diarized_wavs])
-            # pad tensors in diarized_wavs with "float('-inf')" to have same size
-            diarized_wavs = [
-                torch.nn.functional.pad(
-                    x, (0, max_len - x.size(2)), "constant", float("-inf")
-                )
-                for x in diarized_wavs
-            ]
-            spk_prediction = torch.cat(diarized_wavs, dim=1)
-            waves = None
-        else:
-            # b. Diarization Forward
-            encoder_out, encoder_out_lens = self.encode(speech, lengths)
-            spk_prediction, num_spk = self.decode(encoder_out, encoder_out_lens)
-            if self.enh_s2t_task:
-                # Segment-wise speech separation
-                # Note that this is done after diarization using the whole sequence
-                if self.segmenting_enh_diar and lengths[0] > self.segment_size * fs:
-                    overlap_length = int(
-                        np.round(fs * (self.segment_size - self.hop_size))
-                    )
-                    num_segments = int(
-                        np.ceil(
-                            (speech.size(1) - overlap_length) / (self.hop_size * fs)
-                        )
-                    )
-                    t = T = int(self.segment_size * fs)
-                    pad_shape = speech[:, :T].shape
-                    enh_waves = []
-                    range_ = trange if self.show_progressbar else range
-                    for i in range_(num_segments):
-                        st = int(i * self.hop_size * fs)
-                        en = st + T
-                        if en >= lengths[0]:
-                            # en - st < T (last segment)
-                            en = lengths[0]
-                            speech_seg = speech.new_zeros(pad_shape)
-                            t = en - st
-                            speech_seg[:, :t] = speech[:, st:en]
-                        else:
-                            t = T
-                            speech_seg = speech[:, st:en]  # B x T [x C]
-
-                        lengths_seg = speech.new_full(
-                            [batch_size], dtype=torch.long, fill_value=T
-                        )
-                        # Separation Forward
-                        _, _, processed_wav = self.diar_model.encode_diar(
-                            speech_seg, lengths_seg, num_spk
-                        )
-                        if self.normalize_segment_scale:
-                            # normalize the scale to match the input mixture scale
-                            mix_energy = torch.sqrt(
-                                torch.mean(
-                                    speech_seg[:, :t].pow(2), dim=1, keepdim=True
-                                )
-                            )
-                            enh_energy = torch.sqrt(
-                                torch.mean(
-                                    sum(processed_wav)[:, :t].pow(2),
-                                    dim=1,
-                                    keepdim=True,
-                                )
-                            )
-                            processed_wav = [
-                                w * (mix_energy / enh_energy) for w in processed_wav
-                            ]
-                        # List[torch.Tensor(num_spk, B, T)]
-                        enh_waves.append(torch.stack(processed_wav, dim=0))
-
-                    # c. Stitch the enhanced segments together
-                    waves = enh_waves[0]
-                    for i in range(1, num_segments):
-                        # permutation between separated streams
-                        # in last and current segments
-                        perm = self.cal_permumation(
-                            waves[:, :, -overlap_length:],
-                            enh_waves[i][:, :, :overlap_length],
-                            criterion="si_snr",
-                        )
-                        # repermute separated streams in current segment
-                        for batch in range(batch_size):
-                            enh_waves[i][:, batch] = enh_waves[i][perm[batch], batch]
-
-                        if i == num_segments - 1:
-                            enh_waves[i][:, :, t:] = 0
-                            enh_waves_res_i = enh_waves[i][:, :, overlap_length:t]
-                        else:
-                            enh_waves_res_i = enh_waves[i][:, :, overlap_length:]
-
-                        # overlap-and-add (average over the overlapped part)
-                        waves[:, :, -overlap_length:] = (
-                            waves[:, :, -overlap_length:]
-                            + enh_waves[i][:, :, :overlap_length]
-                        ) / 2
-                        # concatenate the residual parts of the later segment
-                        waves = torch.cat([waves, enh_waves_res_i], dim=2)
-                    # ensure the stitched length is same as input
-                    assert waves.size(2) == speech.size(1), (waves.shape, speech.shape)
-                    waves = torch.unbind(waves, dim=0)
-                else:
-                    # Separation Forward using the whole signal
-                    _, _, waves = self.diar_model.encode_diar(speech, lengths, num_spk)
-                # multiply diarization result and separation result
-                # by calculating the correlation
-                if self.multiply_diar_result:
-                    spk_prediction, interp_prediction, _ = self.permute_diar(
-                        waves, spk_prediction
-                    )
-                    waves = [
-                        waves[i] * interp_prediction[:, :, i] for i in range(num_spk)
-                    ]
-                if self.normalize_output_wav:
-                    waves = [
-                        (w / abs(w).max(dim=1, keepdim=True)[0] * 0.9).cpu().numpy()
-                        for w in waves
-                    ]  # list[(batch, sample)]
-                else:
-                    waves = [w.cpu().numpy() for w in waves]
+        # b. Forward Encoder
+        enc, enc_olens = self.asr_model.encode(**batch)
+        if self.multi_asr:
+            enc = enc.unbind(dim=1)  # (batch, num_inf, ...) -> num_inf x [batch, ...]
+        if self.enh_s2t_task or self.multi_asr:
+            # Enh+ASR joint task or Multispkr ASR task
+            # NOTE (Wangyou): the return type in this case is List[default_return_type]
+            if self.multi_asr:
+                num_spk = getattr(self.asr_model, "num_inf", 1)
             else:
-                waves = None
+                num_spk = getattr(self.asr_model.enh_model, "num_spk", 1)
+            assert len(enc) == num_spk, (len(enc), num_spk)
+            results = []
+            for spk, enc_spk in enumerate(enc, 1):
+                logging.info(f"=== [{str(self.asr_model.__class__)}] Speaker {spk} ===")
+                if isinstance(enc_spk, tuple):
+                    enc_spk = enc_spk[0]
+                assert len(enc_spk) == 1, len(enc_spk)
 
-        if self.num_spk is not None:
-            assert spk_prediction.size(2) == self.num_spk, (
-                spk_prediction.size(2),
-                self.num_spk,
+                # c. Passed the encoder result and the beam search
+                if hasattr(self, "_decode_single_sample_with_dysfl") and isinstance(self.asr_model, ESPnetASRDysflModel):
+                    logging.info("非流暢性検出と一緒にデコードします")
+                    ret = self._decode_single_sample_with_dysfl(enc_spk[0], speech, lengths)
+                else:
+                    ret = self._decode_single_sample(enc_spk[0])
+                results.append(ret)
+
+        else:
+            # Normal ASR
+            intermediate_outs = None
+            if isinstance(enc, tuple):
+                intermediate_outs = enc[1]
+                enc = enc[0]
+            assert len(enc) == 1, len(enc)
+
+            # c. Passed the encoder result and the beam search
+            if hasattr(self, "_decode_single_sample_with_dysfl") and isinstance(self.asr_model, ESPnetASRDysflModel):
+                logging.info("非流暢性検出と一緒にデコードします")
+                results = self._decode_single_sample_with_dysfl(enc[0], speech, lengths)
+            else:
+                results = self._decode_single_sample(enc[0])
+
+            # Encoder intermediate CTC predictions
+            if intermediate_outs is not None:
+                encoder_interctc_res = self._decode_interctc(intermediate_outs)
+                results = (results, encoder_interctc_res)
+
+        return results
+
+    def _decode_single_sample_with_dysfl(self, enc: torch.Tensor, speech: torch.Tensor, lengths: torch.Tensor) -> List:
+        """非流暢性検出付きのデコード処理"""
+        # 通常のデコードでnbest_hypsを取得
+        logging.info("非流暢性検出付きデコード処理を開始")
+        nbest_hyps = self._decode_single_sample(enc)
+        
+        try:
+            # ASR結果から対応するテキストとその長さを取得
+            text_tensors = []
+            text_lengths = []
+            orig_indices = []  # 元の仮説のインデックスを保存
+            
+            # デバッグ用ログ追加
+            logging.info(f"nbest_hyps数: {len(nbest_hyps)}")
+            
+            for i, hyp in enumerate(nbest_hyps):
+                logging.info(f"処理中の仮説 {i+1}: {type(hyp)}")
+                
+                if isinstance(hyp, tuple) and len(hyp) >= 3:
+                    # タプル形式の場合
+                    text, token, token_int = hyp[:3]
+                    if token_int:
+                        logging.info(f"タプルからトークンID抽出: {token_int[:10]}{'...' if len(token_int) > 10 else ''}")
+                        text_tensors.append(torch.tensor(token_int, device=enc.device))
+                        text_lengths.append(len(token_int))
+                        orig_indices.append(i)
+                
+                elif hasattr(hyp, 'yseq'):
+                    # Hypothesisオブジェクトの場合
+                    if isinstance(hyp.yseq, list):
+                        token_ids = hyp.yseq[1:] if hasattr(self.asr_model, 'use_transducer_decoder') and self.asr_model.use_transducer_decoder else hyp.yseq[1:-1]
+                        token_ids = [x for x in token_ids if x != 0]  # ブランクを除去
+                    else:
+                        last_pos = None if hasattr(self.asr_model, 'use_transducer_decoder') and self.asr_model.use_transducer_decoder else -1
+                        token_ids = hyp.yseq[1:last_pos].tolist()
+                        token_ids = [x for x in token_ids if x != 0]  # ブランクを除去
+                    
+                    if token_ids:  # 空でないか確認
+                        logging.info(f"トークンID抽出: {token_ids[:10]}{'...' if len(token_ids) > 10 else ''}")
+                        text_tensors.append(torch.tensor(token_ids, device=enc.device))
+                        text_lengths.append(len(token_ids))
+                        orig_indices.append(i)
+                    else:
+                        logging.warning(f"仮説 {i+1}: トークンIDが空です")
+                else:
+                    logging.warning(f"仮説 {i+1}: 処理できないタイプです: {type(hyp)}")
+            
+            # 非流暢性情報を保存するインスタンス変数を初期化
+            self.dysfl_probs = [None] * len(nbest_hyps)
+            self.dysfl_preds = [None] * len(nbest_hyps)
+            
+            # テキストがある場合のみ予測処理
+            if text_tensors:
+                logging.info(f"有効なテキスト例数: {len(text_tensors)}, 長さ: {text_lengths}")
+                
+                # バッチ処理のためにパディング
+                max_len = max(text_lengths) if text_lengths else 0
+                padded_text = []
+                for tensor in text_tensors:
+                    if len(tensor) < max_len:
+                        padding = torch.full((max_len - len(tensor),), self.asr_model.ignore_id, 
+                                        dtype=tensor.dtype, device=tensor.device)
+                        padded_text.append(torch.cat([tensor, padding]))
+                    else:
+                        padded_text.append(tensor)
+                
+                if padded_text:
+                    padded_text = torch.stack(padded_text)
+                    text_lengths = torch.tensor(text_lengths, device=enc.device)
+                    
+                    logging.info(f"非流暢性予測の入力: text={padded_text.shape}, lengths={text_lengths.shape}")
+                    
+                    # 非流暢性予測
+                    dysfl_probs, dysfl_preds = self.asr_model.predict_dysfl(
+                        speech,
+                        lengths,
+                        padded_text,
+                        text_lengths
+                    )
+                    
+                    # 結果をリストに保存（元の仮説インデックスを使用）
+                    for i, (idx, length) in enumerate(zip(orig_indices, text_lengths)):
+                        self.dysfl_probs[idx] = dysfl_probs[i, :length].detach().cpu()
+                        self.dysfl_preds[idx] = dysfl_preds[i, :length].detach().cpu()
+                        logging.info(f"非流暢性予測結果 {i} (元インデックス {idx}): probs={self.dysfl_probs[idx].shape}, preds={self.dysfl_preds[idx].shape}")
+            else:
+                logging.warning("非流暢性予測をスキップ: テキストがありません")
+            
+            # 元の結果をそのまま返す（型チェックに合格するため）
+            return nbest_hyps
+            
+        except Exception as e:
+            logging.error(f"非流暢性予測中にエラーが発生しました: {str(e)}")
+            import traceback
+            logging.error(traceback.format_exc())
+            
+            # エラーが発生した場合は通常の結果を返す
+            return nbest_hyps
+
+    @typechecked
+    def _decode_interctc(
+        self, intermediate_outs: List[Tuple[int, torch.Tensor]]
+    ) -> Dict[int, List[str]]:
+
+        exclude_ids = [self.asr_model.blank_id, self.asr_model.sos, self.asr_model.eos]
+        res = {}
+        token_list = self.beam_search.token_list
+
+        for layer_idx, encoder_out in intermediate_outs:
+            y = self.asr_model.ctc.argmax(encoder_out)[0]  # batch_size = 1
+            y = [x[0] for x in groupby(y) if x[0] not in exclude_ids]
+            y = [token_list[x] for x in y]
+
+            res[layer_idx] = y
+
+        return res
+
+    @typechecked
+    def _decode_single_sample(self, enc: torch.Tensor) -> ListOfHypothesis:
+        if self.beam_search_transducer:
+            logging.info("encoder output length: " + str(enc.shape[0]))
+            nbest_hyps = self.beam_search_transducer(enc)
+
+            best = nbest_hyps[0]
+            logging.info(f"total log probability: {best.score:.2f}")
+            logging.info(
+                f"normalized log probability: {best.score / len(best.yseq):.2f}"
             )
-        assert spk_prediction.size(0) == batch_size, (
-            spk_prediction.size(0),
-            batch_size,
-        )
-        spk_prediction = spk_prediction.cpu().numpy()
-        spk_prediction = 1 / (1 + np.exp(-spk_prediction))
+            logging.info(
+                "best hypo: " + "".join(self.converter.ids2tokens(best.yseq[1:])) + "\n"
+            )
+        elif self.hugging_face_model:
+            num_beams = self.hugging_face_decoder_conf["num_beams"]
+            enc = self.hugging_face_linear_in(enc).unsqueeze(0)
+            if self.asr_model.decoder.causal_lm:
+                forward_args, _ = self.asr_model.decoder.add_prefix_postfix(
+                    enc,
+                    torch.tensor([enc.shape[1]]).to(enc.device),
+                    torch.ones([1, 1], dtype=int, device=enc.device),
+                    torch.ones([1], dtype=int, device=enc.device),
+                )
 
-        return waves, spk_prediction if self.enh_s2t_task else spk_prediction
+                # input_ids are ignored if we provide inputs_embeds,
+                # but input_ids are still required, so we make fake ones
+                input_ids = torch.ones(
+                    [1, forward_args["inputs_embeds"].shape[1]],
+                    dtype=int,
+                    device=enc.device,
+                )
 
-    @torch.no_grad()
-    def cal_permumation(self, ref_wavs, enh_wavs, criterion="si_snr"):
-        """Calculate the permutation between seaprated streams in two adjacent segments.
+                yseq = self.hugging_face_model.generate(
+                    input_ids.repeat(num_beams, 1),
+                    inputs_embeds=forward_args["inputs_embeds"].repeat(num_beams, 1, 1),
+                    attention_mask=input_ids.repeat(num_beams, 1),
+                    **self.hugging_face_decoder_conf,
+                )
 
-        Args:
-            ref_wavs (List[torch.Tensor]): [(Batch, Nsamples)]
-            enh_wavs (List[torch.Tensor]): [(Batch, Nsamples)]
-            criterion (str): one of ("si_snr", "mse", "corr)
-        Returns:
-            perm (torch.Tensor): permutation for enh_wavs (Batch, num_spk)
-        """
+                yseq = yseq[:, input_ids.shape[1] - 1 :]
+            else:
+                decoder_start_token_id = (
+                    self.hugging_face_model.config.decoder_start_token_id
+                )
+                yseq = self.hugging_face_model.generate(
+                    encoder_outputs=ModelOutput(last_hidden_state=enc),
+                    decoder_start_token_id=decoder_start_token_id,
+                    **self.hugging_face_decoder_conf,
+                )
 
-        criterion_class = {"si_snr": SISNRLoss, "mse": FrequencyDomainMSE}[criterion]
+            nbest_hyps = [Hypothesis(yseq=yseq[0])]
+            logging.info(
+                "best hypo: "
+                + self.tokenizer.tokens2text(
+                    self.converter.ids2tokens(nbest_hyps[0].yseq[1:])
+                )
+                + "\n"
+            )
+        else:
+            if hasattr(self.beam_search.nn_dict, "decoder"):
+                if isinstance(self.beam_search.nn_dict.decoder, S4Decoder):
+                    # Setup: required for S4 autoregressive generation
+                    for module in self.beam_search.nn_dict.decoder.modules():
+                        if hasattr(module, "setup_step"):
+                            module.setup_step()
+            nbest_hyps = self.beam_search(
+                x=enc, maxlenratio=self.maxlenratio, minlenratio=self.minlenratio
+            )
 
-        pit_solver = PITSolver(criterion=criterion_class())
+        nbest_hyps = nbest_hyps[: self.nbest]
 
-        _, _, others = pit_solver(ref_wavs, enh_wavs)
-        perm = others["perm"]
-        return perm
+        results = []
+        for hyp in nbest_hyps:
+            assert isinstance(hyp, (Hypothesis, TransHypothesis)), type(hyp)
+
+            # remove sos/eos and get results
+            last_pos = None if self.asr_model.use_transducer_decoder else -1
+            if isinstance(hyp.yseq, list):
+                token_int = hyp.yseq[1:last_pos]
+            else:
+                token_int = hyp.yseq[1:last_pos].tolist()
+
+            # remove blank symbol id, which is assumed to be 0
+            token_int = list(filter(lambda x: x != 0, token_int))
+
+            # Change integer-ids to tokens
+            token = self.converter.ids2tokens(token_int)
+
+            if self.tokenizer is not None:
+                text = self.tokenizer.tokens2text(token)
+            else:
+                text = None
+            results.append((text, token, token_int, hyp))
+
+        return results
 
     @staticmethod
     def from_pretrained(
         model_tag: Optional[str] = None,
         **kwargs: Optional[Any],
     ):
-        """Build DiarizeSpeech instance from the pretrained model.
+        """Build Speech2Text instance from the pretrained model.
 
         Args:
             model_tag (Optional[str]): Model tag of the pretrained models.
                 Currently, the tags of espnet_model_zoo are supported.
 
         Returns:
-            DiarizeSpeech: DiarizeSpeech instance.
+            Speech2Text: Speech2Text instance.
 
         """
         if model_tag is not None:
@@ -368,127 +805,63 @@ class DiarizeSpeech:
             d = ModelDownloader()
             kwargs.update(**d.download_and_unpack(model_tag))
 
-        return DiarizeSpeech(**kwargs)
-
-    def permute_diar(self, waves, spk_prediction):
-        # Permute the diarization result using the correlation
-        # between wav and spk_prediction
-        # FIXME(YushiUeda): batch_size > 1 is not considered
-        num_spk = len(waves)
-        permute_list = [np.array(p) for p in permutations(range(num_spk))]
-        corr_list = []
-        interp_prediction = F.interpolate(
-            torch.sigmoid(spk_prediction).transpose(1, 2),
-            size=waves[0].size(1),
-            mode="linear",
-        ).transpose(1, 2)
-        for p in permute_list:
-            diar_perm = interp_prediction[:, :, p]
-            corr_perm = [0]
-            for q in range(num_spk):
-                corr_perm += np.corrcoef(
-                    torch.squeeze(abs(waves[q])).cpu().numpy(),
-                    torch.squeeze(diar_perm[:, :, q]).cpu().numpy(),
-                )[0, 1]
-            corr_list.append(corr_perm)
-        max_corr, max_idx = torch.max(torch.from_numpy(np.array(corr_list)), dim=0)
-        return (
-            spk_prediction[:, :, permute_list[max_idx]],
-            interp_prediction[:, :, permute_list[max_idx]],
-            permute_list[max_idx],
-        )
-
-    def encode(self, speech, lengths):
-        if self.enh_s2t_task:
-            encoder_out, encoder_out_lens, _ = self.diar_model.encode_diar(
-                speech, lengths, self.num_spk
-            )
-        else:
-            bottleneck_feats = bottleneck_feats_lengths = None
-            encoder_out, encoder_out_lens = self.diar_model.encode(
-                speech, lengths, bottleneck_feats, bottleneck_feats_lengths
-            )
-        return encoder_out, encoder_out_lens
-
-    def decode(self, encoder_out, encoder_out_lens):
-        # SA-EEND
-        if self.diar_model.attractor is None:
-            assert self.num_spk is not None, 'Argument "num_spk" must be specified'
-            spk_prediction = self.diar_model.decoder(encoder_out, encoder_out_lens)
-            num_spk = self.num_spk
-        # EEND-EDA
-        else:
-            # if num_spk is specified, use that number
-            if self.num_spk is not None:
-                attractor, att_prob = self.diar_model.attractor(
-                    encoder_out,
-                    encoder_out_lens,
-                    to_device(
-                        torch.zeros(
-                            encoder_out.size(0),
-                            self.num_spk + 1,
-                            encoder_out.size(2),
-                        ),
-                        device=self.device,
-                    ),
-                )
-                spk_prediction = torch.bmm(
-                    encoder_out,
-                    attractor[:, : self.num_spk, :].permute(0, 2, 1),
-                )
-                num_spk = self.num_spk
-            # else find the first att_prob[i] < 0
-            else:
-                max_num_spk = 15  # upper bound number for estimation
-                attractor, att_prob = self.diar_model.attractor(
-                    encoder_out,
-                    encoder_out_lens,
-                    to_device(
-                        torch.zeros(
-                            encoder_out.size(0),
-                            max_num_spk + 1,
-                            encoder_out.size(2),
-                        ),
-                        device=self.device,
-                    ),
-                )
-                att_prob = torch.squeeze(att_prob)
-                for num_spk in range(len(att_prob)):
-                    if att_prob[num_spk].item() < 0:
-                        break
-                spk_prediction = torch.bmm(
-                    encoder_out, attractor[:, :num_spk, :].permute(0, 2, 1)
-                )
-        return spk_prediction, num_spk
+        return Speech2Text(**kwargs)
 
 
 @typechecked
 def inference(
     output_dir: str,
+    maxlenratio: float,
+    minlenratio: float,
     batch_size: int,
     dtype: str,
-    fs: int,
+    beam_size: int,
     ngpu: int,
     seed: int,
+    ctc_weight: float,
+    lm_weight: float,
+    ngram_weight: float,
+    penalty: float,
+    nbest: int,
+    normalize_length: bool,
     num_workers: int,
     log_level: Union[int, str],
     data_path_and_name_and_type: Sequence[Tuple[str, str, str]],
     key_file: Optional[str],
-    train_config: Optional[str],
-    model_file: Optional[str],
+    asr_train_config: Optional[str],
+    asr_model_file: Optional[str],
+    lm_train_config: Optional[str],
+    lm_file: Optional[str],
+    word_lm_train_config: Optional[str],
+    word_lm_file: Optional[str],
+    ngram_file: Optional[str],
     model_tag: Optional[str],
+    token_type: Optional[str],
+    bpemodel: Optional[str],
     allow_variable_data_keys: bool,
-    segment_size: Optional[float],
-    hop_size: Optional[float],
-    normalize_segment_scale: bool,
-    show_progressbar: bool,
-    num_spk: Optional[int],
-    normalize_output_wav: bool,
-    multiply_diar_result: bool,
+    transducer_conf: Optional[dict],
+    streaming: bool,
     enh_s2t_task: bool,
+    quantize_asr_model: bool,
+    quantize_lm: bool,
+    quantize_modules: List[str],
+    quantize_dtype: str,
+    hugging_face_decoder: bool,
+    hugging_face_decoder_conf: Dict[str, Any],
+    time_sync: bool,
+    multi_asr: bool,
+    lang_prompt_token: Optional[str],
+    nlp_prompt_token: Optional[str],
+    prompt_token_file: Optional[str],
+    partial_ar: bool,
+    threshold_probability: float,
+    max_seq_len: int,
+    max_mask_parallel: int,
 ):
     if batch_size > 1:
         raise NotImplementedError("batch decoding is not implemented")
+    if word_lm_train_config is not None:
+        raise NotImplementedError("Word LM is not implemented")
     if ngpu > 1:
         raise NotImplementedError("only single GPU decoding is supported")
 
@@ -505,90 +878,157 @@ def inference(
     # 1. Set random-seed
     set_all_random_seed(seed)
 
-    # 2. Build separate_speech
-    diarize_speech_kwargs = dict(
-        train_config=train_config,
-        model_file=model_file,
-        segment_size=segment_size,
-        hop_size=hop_size,
-        normalize_segment_scale=normalize_segment_scale,
-        show_progressbar=show_progressbar,
-        normalize_output_wav=normalize_output_wav,
-        num_spk=num_spk,
+    # 2. Build speech2text
+    speech2text_kwargs = dict(
+        asr_train_config=asr_train_config,
+        asr_model_file=asr_model_file,
+        transducer_conf=transducer_conf,
+        lm_train_config=lm_train_config,
+        lm_file=lm_file,
+        ngram_file=ngram_file,
+        token_type=token_type,
+        bpemodel=bpemodel,
         device=device,
+        maxlenratio=maxlenratio,
+        minlenratio=minlenratio,
         dtype=dtype,
-        multiply_diar_result=multiply_diar_result,
+        beam_size=beam_size,
+        ctc_weight=ctc_weight,
+        lm_weight=lm_weight,
+        ngram_weight=ngram_weight,
+        penalty=penalty,
+        nbest=nbest,
+        normalize_length=normalize_length,
+        streaming=streaming,
         enh_s2t_task=enh_s2t_task,
+        multi_asr=multi_asr,
+        quantize_asr_model=quantize_asr_model,
+        quantize_lm=quantize_lm,
+        quantize_modules=quantize_modules,
+        quantize_dtype=quantize_dtype,
+        hugging_face_decoder=hugging_face_decoder,
+        hugging_face_decoder_conf=hugging_face_decoder_conf,
+        time_sync=time_sync,
+        prompt_token_file=prompt_token_file,
+        lang_prompt_token=lang_prompt_token,
+        nlp_prompt_token=nlp_prompt_token,
+        partial_ar=partial_ar,
+        threshold_probability=threshold_probability,
+        max_seq_len=max_seq_len,
+        max_mask_parallel=max_mask_parallel,
     )
-    diarize_speech = DiarizeSpeech.from_pretrained(
+    speech2text = Speech2Text.from_pretrained(
         model_tag=model_tag,
-        **diarize_speech_kwargs,
+        **speech2text_kwargs,
     )
 
     # 3. Build data-iterator
-    loader = DiarizationTask.build_streaming_iterator(
+    loader = ASRTask.build_streaming_iterator(
         data_path_and_name_and_type,
         dtype=dtype,
         batch_size=batch_size,
         key_file=key_file,
         num_workers=num_workers,
-        preprocess_fn=DiarizationTask.build_preprocess_fn(
-            diarize_speech.diar_train_args, False
-        ),
-        collate_fn=DiarizationTask.build_collate_fn(
-            diarize_speech.diar_train_args, False
-        ),
+        preprocess_fn=ASRTask.build_preprocess_fn(speech2text.asr_train_args, False),
+        collate_fn=ASRTask.build_collate_fn(speech2text.asr_train_args, False),
         allow_variable_data_keys=allow_variable_data_keys,
         inference=True,
     )
 
-    # 4. Start for-loop
-    writer = NpyScpWriter(f"{output_dir}/predictions", f"{output_dir}/diarize.scp")
+    # 7 .Start for-loop
+    # FIXME(kamo): The output format should be discussed about
+    with DatadirWriter(output_dir) as writer:
+        for keys, batch in loader:
+            assert isinstance(batch, dict), type(batch)
+            assert all(isinstance(s, str) for s in keys), keys
+            _bs = len(next(iter(batch.values())))
+            assert len(keys) == _bs, f"{len(keys)} != {_bs}"
+            batch = {k: v[0] for k, v in batch.items() if not k.endswith("_lengths")}
 
-    if enh_s2t_task:
-        wav_writers = []
-        if diarize_speech.num_spk is not None:
-            for i in range(diarize_speech.num_spk):
-                wav_writers.append(
-                    SoundScpWriter(
-                        f"{output_dir}/wavs/{i + 1}", f"{output_dir}/spk{i + 1}.scp"
-                    )
-                )
-        else:
-            for i in range(diarize_speech.diar_model.mask_module.max_num_spk):
-                wav_writers.append(
-                    SoundScpWriter(
-                        f"{output_dir}/wavs/{i + 1}", f"{output_dir}/spk{i + 1}.scp"
-                    )
-                )
+            # N-best list of (text, token, token_int, hyp_object)
+            try:
+                results = speech2text(**batch)
+            except TooShortUttError as e:
+                logging.warning(f"Utterance {keys} {e}")
+                hyp = Hypothesis(score=0.0, scores={}, states={}, yseq=[])
+                results = [[" ", ["<space>"], [2], hyp]] * nbest
+                if enh_s2t_task:
+                    num_spk = getattr(speech2text.asr_model.enh_model, "num_spk", 1)
+                    results = [results for _ in range(num_spk)]
 
-    for keys, batch in loader:
-        assert isinstance(batch, dict), type(batch)
-        assert all(isinstance(s, str) for s in keys), keys
-        _bs = len(next(iter(batch.values())))
-        assert len(keys) == _bs, f"{len(keys)} != {_bs}"
-        batch = {k: v for k, v in batch.items() if not k.endswith("_lengths")}
+            # Only supporting batch_size==1
+            key = keys[0]
+            if enh_s2t_task or multi_asr:
+                # Enh+ASR joint task
+                for spk, ret in enumerate(results, 1):
+                    for n, result in zip(range(1, nbest + 1), ret):
+                        # Create a directory: outdir/{n}best_recog_spk?
+                        ibest_writer = writer[f"{n}best_recog"]
 
-        if enh_s2t_task:
-            waves, spk_predictions = diarize_speech(**batch)
-            for b in range(batch_size):
-                writer[keys[b]] = spk_predictions[b]
-                for spk, w in enumerate(waves):
-                    wav_writers[spk][keys[b]] = fs, w[b]
-        else:
-            spk_predictions = diarize_speech(**batch)
-            for b in range(batch_size):
-                writer[keys[b]] = spk_predictions[b]
+                        # Write the result to each file
+                        ibest_writer[f"token_spk{spk}"][key] = " ".join(result[1])
+                        ibest_writer[f"token_int_spk{spk}"][key] = " ".join(
+                            map(str, result[2])
+                        )
+                        ibest_writer[f"score_spk{spk}"][key] = str(result[3].score)
 
-    if enh_s2t_task:
-        for w in wav_writers:
-            w.close()
-    writer.close()
+                        if result[0] is not None:
+                            ibest_writer[f"text_spk{spk}"][key] = result[0]
+                            
+                        # 非流暢性検出結果があれば保存
+                        if hasattr(speech2text, "dysfl_probs") and hasattr(speech2text, "dysfl_preds"):
+                            idx = n - 1  # nbestのインデックス
+                            if idx < len(speech2text.dysfl_probs) and speech2text.dysfl_probs[idx] is not None:
+                                ibest_writer[f"dysfl_probs_spk{spk}"][key] = " ".join(
+                                    [f"{p.item():.6f}" for p in speech2text.dysfl_probs[idx]]
+                                )
+                            if idx < len(speech2text.dysfl_preds) and speech2text.dysfl_preds[idx] is not None:
+                                ibest_writer[f"dysfl_preds_spk{spk}"][key] = " ".join(
+                                    [f"{int(p.item())}" for p in speech2text.dysfl_preds[idx]]
+                                )
 
+            else:
+                # Normal ASR
+                encoder_interctc_res = None
+                if isinstance(results, tuple):
+                    results, encoder_interctc_res = results
+
+                for n, result in zip(range(1, nbest + 1), results):
+                    # Create a directory: outdir/{n}best_recog
+                    ibest_writer = writer[f"{n}best_recog"]
+
+                    # Write the result to each file
+                    ibest_writer["token"][key] = " ".join(result[1])
+                    ibest_writer["token_int"][key] = " ".join(map(str, result[2]))
+                    ibest_writer["score"][key] = str(result[3].score)
+
+                    if result[0] is not None:
+                        ibest_writer["text"][key] = result[0]
+                        
+                    # 非流暢性検出結果があれば保存
+                    if hasattr(speech2text, "dysfl_probs") and hasattr(speech2text, "dysfl_preds"):
+                        idx = n - 1  # nbestのインデックス
+                        if idx < len(speech2text.dysfl_probs) and speech2text.dysfl_probs[idx] is not None:
+                            ibest_writer["dysfl_probs"][key] = " ".join(
+                                [f"{p.item():.6f}" for p in speech2text.dysfl_probs[idx]]
+                            )
+                        if idx < len(speech2text.dysfl_preds) and speech2text.dysfl_preds[idx] is not None:
+                            ibest_writer["dysfl_preds"][key] = " ".join(
+                                [f"{int(p.item())}" for p in speech2text.dysfl_preds[idx]]
+                            )
+
+                # Write intermediate predictions to
+                # encoder_interctc_layer<layer_idx>.txt
+                ibest_writer = writer["1best_recog"]
+                if encoder_interctc_res is not None:
+                    for idx, text in encoder_interctc_res.items():
+                        ibest_writer[f"encoder_interctc_layer{idx}.txt"][key] = (
+                            " ".join(text)
+                        )
 
 def get_parser():
     parser = config_argparse.ArgumentParser(
-        description="Speaker Diarization inference",
+        description="ASR Decoding",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -617,12 +1057,6 @@ def get_parser():
         help="Data type",
     )
     parser.add_argument(
-        "--fs",
-        type=humanfriendly_parse_size_or_none,
-        default=8000,
-        help="Sampling rate",
-    )
-    parser.add_argument(
         "--num_workers",
         type=int,
         default=1,
@@ -641,82 +1075,215 @@ def get_parser():
 
     group = parser.add_argument_group("The model configuration related")
     group.add_argument(
-        "--train_config",
+        "--asr_train_config",
         type=str,
-        help="Diarization training configuration",
+        help="ASR training configuration",
     )
     group.add_argument(
-        "--model_file",
+        "--asr_model_file",
         type=str,
-        help="Diarization model parameter file",
+        help="ASR model parameter file",
+    )
+    group.add_argument(
+        "--lm_train_config",
+        type=str,
+        help="LM training configuration",
+    )
+    group.add_argument(
+        "--lm_file",
+        type=str,
+        help="LM parameter file",
+    )
+    group.add_argument(
+        "--word_lm_train_config",
+        type=str,
+        help="Word LM training configuration",
+    )
+    group.add_argument(
+        "--word_lm_file",
+        type=str,
+        help="Word LM parameter file",
+    )
+    group.add_argument(
+        "--ngram_file",
+        type=str,
+        help="N-gram parameter file",
     )
     group.add_argument(
         "--model_tag",
         type=str,
-        help="Pretrained model tag. If specify this option, train_config and "
-        "model_file will be overwritten",
+        help="Pretrained model tag. If specify this option, *_train_config and "
+        "*_file will be overwritten",
+    )
+    group.add_argument(
+        "--enh_s2t_task",
+        type=str2bool,
+        default=False,
+        help="Whether we are using an enhancement and ASR joint model",
+    )
+    group.add_argument(
+        "--multi_asr",
+        type=str2bool,
+        default=False,
+        help="Whether we are using a monolithic multi-speaker ASR model "
+        "(This flag should be False if a speech separation model is used before ASR)",
+    )
+    group = parser.add_argument_group("Quantization related")
+    group.add_argument(
+        "--quantize_asr_model",
+        type=str2bool,
+        default=False,
+        help="Apply dynamic quantization to ASR model.",
+    )
+    group.add_argument(
+        "--quantize_lm",
+        type=str2bool,
+        default=False,
+        help="Apply dynamic quantization to LM.",
+    )
+    group.add_argument(
+        "--quantize_modules",
+        type=str,
+        nargs="*",
+        default=["Linear"],
+        help="""List of modules to be dynamically quantized.
+        E.g.: --quantize_modules=[Linear,LSTM,GRU].
+        Each specified module should be an attribute of 'torch.nn', e.g.:
+        torch.nn.Linear, torch.nn.LSTM, torch.nn.GRU, ...""",
+    )
+    group.add_argument(
+        "--quantize_dtype",
+        type=str,
+        default="qint8",
+        choices=["float16", "qint8"],
+        help="Dtype for dynamic quantization.",
     )
 
-    group = parser.add_argument_group("Data loading related")
+    group = parser.add_argument_group("Beam-search related")
     group.add_argument(
         "--batch_size",
         type=int,
         default=1,
         help="The batch size for inference",
     )
-    group = parser.add_argument_group("Diarize speech related")
+    group.add_argument("--nbest", type=int, default=1, help="Output N-best hypotheses")
+    group.add_argument("--beam_size", type=int, default=20, help="Beam size")
+    group.add_argument("--penalty", type=float, default=0.0, help="Insertion penalty")
     group.add_argument(
-        "--segment_size",
+        "--maxlenratio",
         type=float,
-        default=None,
-        help="Segment length in seconds for segment-wise speaker diarization",
+        default=0.0,
+        help="Input length ratio to obtain max output length. "
+        "If maxlenratio=0.0 (default), it uses a end-detect "
+        "function "
+        "to automatically find maximum hypothesis lengths."
+        "If maxlenratio<0.0, its absolute value is interpreted"
+        "as a constant max output length",
     )
     group.add_argument(
-        "--hop_size",
+        "--minlenratio",
         type=float,
-        default=None,
-        help="Hop length in seconds for segment-wise speech enhancement/separation",
+        default=0.0,
+        help="Input length ratio to obtain min output length",
     )
     group.add_argument(
-        "--show_progressbar",
-        type=str2bool,
-        default=False,
-        help="Whether to show a progress bar when performing segment-wise speaker "
-        "diarization",
+        "--ctc_weight",
+        type=float,
+        default=0.5,
+        help="CTC weight in joint decoding",
     )
+    group.add_argument("--lm_weight", type=float, default=1.0, help="RNNLM weight")
+    group.add_argument("--ngram_weight", type=float, default=0.9, help="ngram weight")
+    group.add_argument("--streaming", type=str2bool, default=False)
+    group.add_argument("--hugging_face_decoder", type=str2bool, default=False)
     group.add_argument(
-        "--num_spk",
-        type=int_or_none,
-        default=None,
-        help="Predetermined number of speakers for inference",
+        "--hugging_face_decoder_conf",
+        type=NestedDictAction,
+        default=dict(),
+        help="Custom kwargs for the HF .generate()",
     )
 
-    group = parser.add_argument_group("Enh + Diar related")
     group.add_argument(
-        "--enh_s2t_task",
-        type=str2bool,
-        default=False,
-        help="enhancement and diarization joint model",
-    )
-    group.add_argument(
-        "--normalize_segment_scale",
-        type=str2bool,
-        default=False,
-        help="Whether to normalize the energy of the separated streams in each segment",
-    )
-    group.add_argument(
-        "--normalize_output_wav",
-        type=str2bool,
-        default=False,
-        help="Whether to normalize the predicted wav to [-1~1]",
-    )
-    group.add_argument(
-        "--multiply_diar_result",
-        type=str2bool,
-        default=False,
-        help="Whether to multiply diar results to separated waves",
+        "--transducer_conf",
+        default=None,
+        help="The keyword arguments for transducer beam search.",
     )
 
+    group = parser.add_argument_group("Text converter related")
+    group.add_argument(
+        "--token_type",
+        type=str_or_none,
+        default=None,
+        choices=["char", "bpe", None],
+        help="The token type for ASR model. "
+        "If not given, refers from the training args",
+    )
+    group.add_argument(
+        "--bpemodel",
+        type=str_or_none,
+        default=None,
+        help="The model path of sentencepiece. "
+        "If not given, refers from the training args",
+    )
+    group.add_argument(
+        "--time_sync",
+        type=str2bool,
+        default=False,
+        help="Time synchronous beam search.",
+    )
+    group.add_argument(
+        "--lang_prompt_token",
+        type=str,
+        default=None,
+        help="Prompt token for mulitlingual prompting",
+    )
+    group.add_argument(
+        "--nlp_prompt_token",
+        type=str,
+        default=None,
+        help="Prompt token for natural language phrases as prompting",
+    )
+    group.add_argument(
+        "--prompt_token_file",
+        type=str,
+        default=None,
+        help="Prompt token file",
+    )
+    group.add_argument(
+        "--normalize_length",
+        type=str2bool,
+        default=False,
+        help="If true, best hypothesis is selected by length-normalized scores",
+    )
+
+    group = parser.add_argument_group("Partially AR related")
+    group.add_argument(
+        "--partial_ar",
+        type=str2bool,
+        default=False,
+        help="Flag to use the partially AR decoding",
+    )
+    group.add_argument(
+        "--threshold_probability",
+        type=float,
+        default=0.99,
+        help="Threshold for probability of the token to be masked",
+    )
+    group.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=5,
+        help="Maximum sequence length for each hypothesis."
+        + "Will stop beam_search after max_seq_len iteration in partially AR decoding.",
+    )
+    group.add_argument(
+        "--max_mask_parallel",
+        type=int,
+        default=-1,
+        help="Maximum number of masks to predict in parallel."
+        + "If you got OOM error, try to decrease this value."
+        + "Default to -1, which means always predict all masks simultaneously.",
+    )
     return parser
 
 
