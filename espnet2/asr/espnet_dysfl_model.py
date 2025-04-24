@@ -65,7 +65,7 @@ class ESPnetASRDysflModel(ESPnetASRModel):
             batch_size = speech.size(0)
             max_length = text_lengths.max().item()
             
-            print(f"isdysfl入力データ: {isdysfl.shape}, {isdysfl.dtype}")
+            # print(f"isdysfl入力データ: {isdysfl.shape}, {isdysfl.dtype}")
             
             try:
                 # isdysflをテンソルに変換
@@ -111,14 +111,14 @@ class ESPnetASRDysflModel(ESPnetASRModel):
                 # 値を0と1に制限
                 dysfl_label = torch.clamp(dysfl_label, 0.0, 1.0)
                 
-                print(f"処理後のdysfl_label: {dysfl_label.shape}, 値範囲: {dysfl_label.min()}-{dysfl_label.max()}")
+                # print(f"処理後のdysfl_label: {dysfl_label.shape}, 値範囲: {dysfl_label.min()}-{dysfl_label.max()}")
                 
                 # 有効な文字のマスクを作成（パディング部分を無視）
                 mask = torch.arange(max_length, device=text_lengths.device)[None, :] < text_lengths[:, None]
                 mask = mask.float()
                 
             except Exception as e:
-                print(f"isdysfl処理エラー: {e}")
+                # print(f"isdysfl処理エラー: {e}")
                 # エラーが発生した場合、ダミーのラベルとマスクを作成
                 dysfl_label = torch.zeros(batch_size, max_length, dtype=torch.float, device=speech.device)
                 mask = torch.arange(max_length, device=text_lengths.device)[None, :] < text_lengths[:, None]
@@ -133,7 +133,7 @@ class ESPnetASRDysflModel(ESPnetASRModel):
             batch_size, enc_length, enc_dim = encoder_out.size()
             
             if enc_length != max_length:
-                print(f"エンコーダ出力長とテキスト長が一致しません: {enc_length} vs {max_length}")
+                # print(f"エンコーダ出力長とテキスト長が一致しません: {enc_length} vs {max_length}")
                 # エンコーダ出力を文字長に合わせる（線形補間による簡易的な方法）
                 resampled_encoder_out = torch.nn.functional.interpolate(
                     encoder_out.transpose(1, 2),  # [batch, dim, frames]
@@ -166,3 +166,56 @@ class ESPnetASRDysflModel(ESPnetASRModel):
             loss = loss_asr
         
         return loss, stats, weight
+    
+    def predict_dysfl(
+        self,
+        speech: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        text: torch.Tensor,
+        text_lengths: torch.Tensor,
+    ):
+        """推論時に非流暢性予測を行うメソッド"""
+        # エンコーダ出力を取得
+        encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
+        if isinstance(encoder_out, tuple):
+            encoder_out = encoder_out[0]
+        
+        # テキストの最大長を取得
+        batch_size, max_length = text.size()
+        
+        # エンコーダ出力の長さを文字長に合わせる
+        _, enc_length, enc_dim = encoder_out.size()
+        
+        logging.info(f"エンコーダ出力サイズ: {encoder_out.size()}, テキストサイズ: {text.size()}")
+        
+        # エンコーダ出力を文字長に合わせる（線形補間による簡易的な方法）
+        if enc_length != max_length:
+            logging.info(f"長さが異なるため補間します: {enc_length} → {max_length}")
+            resampled_encoder_out = torch.nn.functional.interpolate(
+                encoder_out.transpose(1, 2),  # [batch, dim, frames]
+                size=max_length,
+                mode='linear',
+                align_corners=False
+            ).transpose(1, 2)  # [batch, max_length, dim]
+        else:
+            resampled_encoder_out = encoder_out
+        
+        # 文字ごとに分類
+        dysfl_logits = self.dysfl_classifier(resampled_encoder_out).squeeze(-1)  # [batch, max_length]
+        
+        # シグモイド関数で確率に変換
+        dysfl_probs = self.sigmoid(dysfl_logits)
+        
+        # 閾値0.5で二値分類
+        dysfl_preds = (dysfl_probs > 0.5).float()
+        
+        # 無効なパディング部分をマスク（ignore_idの位置）
+        mask = (text != self.ignore_id)
+        
+        # マスクを適用
+        dysfl_probs = dysfl_probs * mask.float()
+        dysfl_preds = dysfl_preds * mask.float()
+        
+        logging.info(f"非流暢性予測完了: {dysfl_probs.size()}, {dysfl_preds.size()}")
+        
+        return dysfl_probs, dysfl_preds
