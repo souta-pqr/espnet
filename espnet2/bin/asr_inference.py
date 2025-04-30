@@ -573,28 +573,58 @@ class Speech2Text:
             # ASR結果から対応するテキストとその長さを取得
             text_tensors = []
             text_lengths = []
+            orig_indices = []  # 元の仮説のインデックスを保存
             
-            for hyp in nbest_hyps:
-                if isinstance(hyp, (Hypothesis, TransHypothesis, ExtTransHypothesis)):
+            # デバッグ用ログ追加
+            logging.info(f"nbest_hyps数: {len(nbest_hyps)}")
+            
+            for i, hyp in enumerate(nbest_hyps):
+                logging.info(f"処理中の仮説 {i+1}: {type(hyp)}")
+                
+                if isinstance(hyp, tuple) and len(hyp) >= 3:
+                    # タプル形式の場合
+                    text, token, token_int = hyp[:3]
+                    if token_int:
+                        logging.info(f"タプルからトークンID抽出: {token_int[:10]}{'...' if len(token_int) > 10 else ''}")
+                        text_tensors.append(torch.tensor(token_int, device=enc.device))
+                        text_lengths.append(len(token_int))
+                        orig_indices.append(i)
+                
+                elif hasattr(hyp, 'yseq'):
+                    # Hypothesisオブジェクトの場合
                     if isinstance(hyp.yseq, list):
-                        token_ids = hyp.yseq[1:] if len(hyp.yseq) <= 2 else hyp.yseq[1:-1]
+                        token_ids = hyp.yseq[1:] if hasattr(self.asr_model, 'use_transducer_decoder') and self.asr_model.use_transducer_decoder else hyp.yseq[1:-1]
+                        token_ids = [x for x in token_ids if x != 0]  # ブランクを除去
                     else:
-                        token_ids = hyp.yseq[1:].tolist() if hyp.yseq.size(0) <= 2 else hyp.yseq[1:-1].tolist()
-                    text_tensors.append(torch.tensor(token_ids, device=enc.device))
-                    text_lengths.append(len(token_ids))
+                        last_pos = None if hasattr(self.asr_model, 'use_transducer_decoder') and self.asr_model.use_transducer_decoder else -1
+                        token_ids = hyp.yseq[1:last_pos].tolist()
+                        token_ids = [x for x in token_ids if x != 0]  # ブランクを除去
+                    
+                    if token_ids:  # 空でないか確認
+                        logging.info(f"トークンID抽出: {token_ids[:10]}{'...' if len(token_ids) > 10 else ''}")
+                        text_tensors.append(torch.tensor(token_ids, device=enc.device))
+                        text_lengths.append(len(token_ids))
+                        orig_indices.append(i)
+                    else:
+                        logging.warning(f"仮説 {i+1}: トークンIDが空です")
+                else:
+                    logging.warning(f"仮説 {i+1}: 処理できないタイプです: {type(hyp)}")
+            
+            # 非流暢性情報を保存するインスタンス変数を初期化
+            self.dysfl_probs = [None] * len(nbest_hyps)
+            self.dysfl_preds = [None] * len(nbest_hyps)
             
             # テキストがある場合のみ予測処理
-            dysfl_probs_list = []
-            dysfl_preds_list = []
-            
             if text_tensors:
+                logging.info(f"有効なテキスト例数: {len(text_tensors)}, 長さ: {text_lengths}")
+                
                 # バッチ処理のためにパディング
                 max_len = max(text_lengths) if text_lengths else 0
                 padded_text = []
                 for tensor in text_tensors:
                     if len(tensor) < max_len:
                         padding = torch.full((max_len - len(tensor),), self.asr_model.ignore_id, 
-                                            dtype=tensor.dtype, device=tensor.device)
+                                        dtype=tensor.dtype, device=tensor.device)
                         padded_text.append(torch.cat([tensor, padding]))
                     else:
                         padded_text.append(tensor)
@@ -613,53 +643,17 @@ class Speech2Text:
                         text_lengths
                     )
                     
-                    # 結果をリストに変換
-                    for i, length in enumerate(text_lengths):
-                        dysfl_probs_list.append(dysfl_probs[i, :length])
-                        dysfl_preds_list.append(dysfl_preds[i, :length])
-                        logging.info(f"非流暢性予測結果 {i}: probs={dysfl_probs_list[-1].shape}, preds={dysfl_preds_list[-1].shape}")
-                else:
-                    logging.warning("非流暢性予測をスキップ: パディングテキストが空です")
-                    for _ in range(len(nbest_hyps)):
-                        dysfl_probs_list.append(None)
-                        dysfl_preds_list.append(None)
+                    # 結果をリストに保存（元の仮説インデックスを使用）
+                    for i, (idx, length) in enumerate(zip(orig_indices, text_lengths)):
+                        self.dysfl_probs[idx] = dysfl_probs[i, :length].detach().cpu()
+                        self.dysfl_preds[idx] = dysfl_preds[i, :length].detach().cpu()
+                        logging.info(f"非流暢性予測結果 {i} (元インデックス {idx}): probs={self.dysfl_probs[idx].shape}, preds={self.dysfl_preds[idx].shape}")
             else:
                 logging.warning("非流暢性予測をスキップ: テキストがありません")
-                for _ in range(len(nbest_hyps)):
-                    dysfl_probs_list.append(None)
-                    dysfl_preds_list.append(None)
-                    
-            # 結果を拡張して非流暢性検出結果も含める
-            extended_results = []
-            for i, (hyp, probs, preds) in enumerate(zip(nbest_hyps, dysfl_probs_list, dysfl_preds_list)):
-                # 通常の結果を取得
-                if isinstance(hyp, (Hypothesis, TransHypothesis, ExtTransHypothesis)):
-                    # remove sos/eos and get results
-                    last_pos = None if self.asr_model.use_transducer_decoder else -1
-                    if isinstance(hyp.yseq, list):
-                        token_int = hyp.yseq[1:last_pos]
-                    else:
-                        token_int = hyp.yseq[1:last_pos].tolist()
-
-                    # remove blank symbol id, which is assumed to be 0
-                    token_int = list(filter(lambda x: x != 0, token_int))
-
-                    # Change integer-ids to tokens
-                    token = self.converter.ids2tokens(token_int)
-
-                    if self.tokenizer is not None:
-                        text = self.tokenizer.tokens2text(token)
-                    else:
-                        text = None
-                        
-                    # 非流暢性結果を含めた拡張結果
-                    extended_results.append((text, token, token_int, hyp, probs, preds))
-                    logging.info(f"拡張結果 {i}: text={text}, probs有={probs is not None}, preds有={preds is not None}")
-                else:
-                    # 元の形式をそのまま保持
-                    extended_results.append(hyp)
-                    
-            return extended_results
+            
+            # 元の結果をそのまま返す（型チェックに合格するため）
+            return nbest_hyps
+            
         except Exception as e:
             logging.error(f"非流暢性予測中にエラーが発生しました: {str(e)}")
             import traceback
@@ -951,14 +945,13 @@ def inference(
             assert len(keys) == _bs, f"{len(keys)} != {_bs}"
             batch = {k: v[0] for k, v in batch.items() if not k.endswith("_lengths")}
 
-            # N-best list of (text, token, token_int, hyp_object, dysfl_probs, dysfl_preds)
+            # N-best list of (text, token, token_int, hyp_object)
             try:
                 results = speech2text(**batch)
             except TooShortUttError as e:
                 logging.warning(f"Utterance {keys} {e}")
                 hyp = Hypothesis(score=0.0, scores={}, states={}, yseq=[])
-                # 非流暢性値はNoneとして追加
-                results = [[" ", ["<space>"], [2], hyp, None, None]] * nbest
+                results = [[" ", ["<space>"], [2], hyp]] * nbest
                 if enh_s2t_task:
                     num_spk = getattr(speech2text.asr_model.enh_model, "num_spk", 1)
                     results = [results for _ in range(num_spk)]
@@ -969,35 +962,30 @@ def inference(
                 # Enh+ASR joint task
                 for spk, ret in enumerate(results, 1):
                     for n, result in zip(range(1, nbest + 1), ret):
-                        # 非流暢性検出結果に対応
-                        if len(result) >= 6:  # 非流暢性検出結果がある場合
-                            text, token, token_int, hyp, dysfl_probs, dysfl_preds = result
-                        else:  # 旧形式の場合
-                            text, token, token_int, hyp = result
-                            dysfl_probs, dysfl_preds = None, None
-                        
                         # Create a directory: outdir/{n}best_recog_spk?
                         ibest_writer = writer[f"{n}best_recog"]
 
                         # Write the result to each file
-                        ibest_writer[f"token_spk{spk}"][key] = " ".join(token)
+                        ibest_writer[f"token_spk{spk}"][key] = " ".join(result[1])
                         ibest_writer[f"token_int_spk{spk}"][key] = " ".join(
-                            map(str, token_int)
+                            map(str, result[2])
                         )
-                        ibest_writer[f"score_spk{spk}"][key] = str(hyp.score)
+                        ibest_writer[f"score_spk{spk}"][key] = str(result[3].score)
 
-                        if text is not None:
-                            ibest_writer[f"text_spk{spk}"][key] = text
+                        if result[0] is not None:
+                            ibest_writer[f"text_spk{spk}"][key] = result[0]
                             
                         # 非流暢性検出結果があれば保存
-                        if dysfl_probs is not None:
-                            ibest_writer[f"dysfl_probs_spk{spk}"][key] = " ".join(
-                                [f"{p.item():.6f}" for p in dysfl_probs]
-                            )
-                        if dysfl_preds is not None:
-                            ibest_writer[f"dysfl_preds_spk{spk}"][key] = " ".join(
-                                [f"{int(p.item())}" for p in dysfl_preds]
-                            )
+                        if hasattr(speech2text, "dysfl_probs") and hasattr(speech2text, "dysfl_preds"):
+                            idx = n - 1  # nbestのインデックス
+                            if idx < len(speech2text.dysfl_probs) and speech2text.dysfl_probs[idx] is not None:
+                                ibest_writer[f"dysfl_probs_spk{spk}"][key] = " ".join(
+                                    [f"{p.item():.6f}" for p in speech2text.dysfl_probs[idx]]
+                                )
+                            if idx < len(speech2text.dysfl_preds) and speech2text.dysfl_preds[idx] is not None:
+                                ibest_writer[f"dysfl_preds_spk{spk}"][key] = " ".join(
+                                    [f"{int(p.item())}" for p in speech2text.dysfl_preds[idx]]
+                                )
 
             else:
                 # Normal ASR
@@ -1006,33 +994,28 @@ def inference(
                     results, encoder_interctc_res = results
 
                 for n, result in zip(range(1, nbest + 1), results):
-                    # 非流暢性検出結果に対応
-                    if len(result) >= 6:  # 非流暢性検出結果がある場合
-                        text, token, token_int, hyp, dysfl_probs, dysfl_preds = result
-                    else:  # 旧形式の場合
-                        text, token, token_int, hyp = result
-                        dysfl_probs, dysfl_preds = None, None
-                        
                     # Create a directory: outdir/{n}best_recog
                     ibest_writer = writer[f"{n}best_recog"]
 
                     # Write the result to each file
-                    ibest_writer["token"][key] = " ".join(token)
-                    ibest_writer["token_int"][key] = " ".join(map(str, token_int))
-                    ibest_writer["score"][key] = str(hyp.score)
+                    ibest_writer["token"][key] = " ".join(result[1])
+                    ibest_writer["token_int"][key] = " ".join(map(str, result[2]))
+                    ibest_writer["score"][key] = str(result[3].score)
 
-                    if text is not None:
-                        ibest_writer["text"][key] = text
+                    if result[0] is not None:
+                        ibest_writer["text"][key] = result[0]
                         
                     # 非流暢性検出結果があれば保存
-                    if dysfl_probs is not None:
-                        ibest_writer["dysfl_probs"][key] = " ".join(
-                            [f"{p.item():.6f}" for p in dysfl_probs]
-                        )
-                    if dysfl_preds is not None:
-                        ibest_writer["dysfl_preds"][key] = " ".join(
-                            [f"{int(p.item())}" for p in dysfl_preds]
-                        )
+                    if hasattr(speech2text, "dysfl_probs") and hasattr(speech2text, "dysfl_preds"):
+                        idx = n - 1  # nbestのインデックス
+                        if idx < len(speech2text.dysfl_probs) and speech2text.dysfl_probs[idx] is not None:
+                            ibest_writer["dysfl_probs"][key] = " ".join(
+                                [f"{p.item():.6f}" for p in speech2text.dysfl_probs[idx]]
+                            )
+                        if idx < len(speech2text.dysfl_preds) and speech2text.dysfl_preds[idx] is not None:
+                            ibest_writer["dysfl_preds"][key] = " ".join(
+                                [f"{int(p.item())}" for p in speech2text.dysfl_preds[idx]]
+                            )
 
                 # Write intermediate predictions to
                 # encoder_interctc_layer<layer_idx>.txt
