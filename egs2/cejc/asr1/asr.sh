@@ -1655,7 +1655,8 @@ if [ ${stage} -le 12 ] && [ ${stop_stage} -ge 12 ] && ! [[ " ${skip_stages} " =~
         # shellcheck disable=SC2068
         for ref_txt in ${ref_text_files[@]}; do
             suffix=$(echo ${ref_txt} | sed 's/text//')
-            for f in token token_int score text; do
+            # 非流暢性検出結果ファイルを追加
+            for f in token token_int score text dysfl_probs dysfl_preds; do
                 if [ -f "${_logdir}/output.1/1best_recog/${f}${suffix}" ]; then
                     for i in $(seq "${_nj}"); do
                         cat "${_logdir}/output.${i}/1best_recog/${f}${suffix}"
@@ -1683,6 +1684,21 @@ if [ ${stage} -le 13 ] && [ ${stop_stage} -ge 13 ] && ! [[ " ${skip_stages} " =~
     for dset in ${_dsets}; do
         _data="${data_feats}/${dset}"
         _dir="${asr_exp}/${inference_tag}/${dset}"
+
+        # 非流暢性検出結果の評価（参照ファイルが存在する場合）
+        if [ -f "${_data}/isdysfl" ] && [ -f "${_dir}/dysfl_preds" ]; then
+            log "Scoring disfluency detection for ${dset}..."
+            _dysfl_scoredir="${_dir}/score_dysfl"
+            mkdir -p "${_dysfl_scoredir}"
+            
+            ${python} -m espnet2.bin.score_dysfl \
+                --pred "${_dir}/dysfl_preds" \
+                --ref "${_data}/isdysfl" \
+                --output "${_dysfl_scoredir}/result.txt"
+            
+            # 結果を表示
+            cat "${_dysfl_scoredir}/result.txt"
+        fi
 
         for _tok_type in "char" "word" "bpe"; do
             [ "${_tok_type}" = bpe ] && [ ! -f "${bpemodel}" ] && continue
