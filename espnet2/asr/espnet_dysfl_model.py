@@ -7,7 +7,7 @@ from espnet2.asr.espnet_model import ESPnetASRModel
 
 
 class ESPnetASRDysflModel(ESPnetASRModel):
-    """ESPnet ASR Model with character-level disfluency classification."""
+    """ESPnet ASR Model with character-level disfluency classification using token-dependency mechanism."""
 
     def __init__(
         self,
@@ -22,7 +22,7 @@ class ESPnetASRDysflModel(ESPnetASRModel):
         dysfl_weight: float = 0.1,
         **kwargs,
     ):
-        print("ESPnetASRDysflModel is being initialized for character-level disfluency detection")
+        print("ESPnetASRDysflModel is being initialized with token-dependency mechanism")
         super().__init__(
             vocab_size=vocab_size,
             token_list=token_list,
@@ -34,12 +34,29 @@ class ESPnetASRDysflModel(ESPnetASRModel):
             ctc=ctc,
             **kwargs,
         )
-        # 文字レベルの分類のための分類器
+        # エンコーダの出力サイズ
         encoder_output_size = encoder.output_size()
-        self.dysfl_classifier = torch.nn.Linear(encoder_output_size, 1)
+        
+        # トークン埋め込みへのアクセスを取得
+        # 注: ASRモデルのデコーダによって埋め込み層の名前が異なる場合があります
+        if hasattr(decoder, "embed"):
+            self.token_embedding = decoder.embed
+            token_embed_size = self.token_embedding.weight.shape[1]
+        else:
+            # 埋め込み層がない場合のフォールバック
+            print("Warning: Decoder does not have 'embed' attribute. Using a new embedding layer.")
+            token_embed_size = 320  # 一般的な埋め込みサイズ
+            self.token_embedding = torch.nn.Embedding(vocab_size, token_embed_size)
+        
+        # トークン依存メカニズム用の分類器
+        # エンコーダ出力とトークン埋め込みを連結したものを入力とする
+        self.dysfl_classifier = torch.nn.Linear(encoder_output_size + token_embed_size, 1)
+        
         self.dysfl_weight = dysfl_weight
         self.sigmoid = torch.nn.Sigmoid()
         self.bce_loss = torch.nn.BCEWithLogitsLoss(reduction="none")
+        
+        print(f"Token-dependency mechanism initialized: encoder_dim={encoder_output_size}, token_embed_dim={token_embed_size}")
 
     def forward(
         self,
@@ -50,7 +67,7 @@ class ESPnetASRDysflModel(ESPnetASRModel):
         isdysfl: torch.Tensor = None,
         **kwargs,
     ):
-        """Forward pass with character-level disfluency classification."""
+        """Forward pass with character-level disfluency classification with token-dependency mechanism."""
         # 通常のASR処理を実行
         loss_asr, stats, weight = super().forward(
             speech=speech,
@@ -111,8 +128,6 @@ class ESPnetASRDysflModel(ESPnetASRModel):
                 # 値を0と1に制限
                 dysfl_label = torch.clamp(dysfl_label, 0.0, 1.0)
                 
-                # print(f"処理後のdysfl_label: {dysfl_label.shape}, 値範囲: {dysfl_label.min()}-{dysfl_label.max()}")
-                
                 # 有効な文字のマスクを作成（パディング部分を無視）
                 mask = torch.arange(max_length, device=text_lengths.device)[None, :] < text_lengths[:, None]
                 mask = mask.float()
@@ -133,7 +148,6 @@ class ESPnetASRDysflModel(ESPnetASRModel):
             batch_size, enc_length, enc_dim = encoder_out.size()
             
             if enc_length != max_length:
-                # print(f"エンコーダ出力長とテキスト長が一致しません: {enc_length} vs {max_length}")
                 # エンコーダ出力を文字長に合わせる（線形補間による簡易的な方法）
                 resampled_encoder_out = torch.nn.functional.interpolate(
                     encoder_out.transpose(1, 2),  # [batch, dim, frames]
@@ -144,8 +158,19 @@ class ESPnetASRDysflModel(ESPnetASRModel):
             else:
                 resampled_encoder_out = encoder_out
             
-            # 文字ごとに分類
-            dysfl_logits = self.dysfl_classifier(resampled_encoder_out).squeeze(-1)  # [batch, max_length]
+            # トークン依存メカニズムの実装
+            # 埋め込み層の最大インデックスを取得
+            vocab_size = self.token_embedding.weight.size(0)
+            # インデックスをクリッピング（0以上vocab_size未満に制限）
+            clipped_text = torch.clamp(text, 0, vocab_size - 1)
+            # 埋め込みを取得
+            token_embeddings = self.token_embedding(clipped_text)  # [batch, max_length, embed_dim]
+            
+            # エンコーダ出力とトークン埋め込みを連結
+            combined_features = torch.cat([resampled_encoder_out, token_embeddings], dim=-1)
+            
+            # 連結した特徴量から非流暢性を予測
+            dysfl_logits = self.dysfl_classifier(combined_features).squeeze(-1)  # [batch, max_length]
             
             # マスクを適用して有効な文字のみで損失を計算
             masked_loss = self.bce_loss(dysfl_logits, dysfl_label) * mask
@@ -174,7 +199,7 @@ class ESPnetASRDysflModel(ESPnetASRModel):
         text: torch.Tensor,
         text_lengths: torch.Tensor,
     ):
-        """推論時に非流暢性予測を行うメソッド"""
+        """推論時に非流暢性予測を行うメソッド（トークン依存メカニズム対応）"""
         try:
             # エンコーダ出力を取得
             encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
@@ -214,8 +239,19 @@ class ESPnetASRDysflModel(ESPnetASRModel):
                     )
                     resampled_encoder_out = torch.cat([encoder_out, padding], dim=1)
             
-            # 文字ごとに分類
-            dysfl_logits = self.dysfl_classifier(resampled_encoder_out).squeeze(-1)  # [batch, max_length]
+            # トークン依存メカニズム - 予測されたトークンの埋め込みを取得
+            # 埋め込み層の最大インデックスを取得
+            vocab_size = self.token_embedding.weight.size(0)
+            # インデックスをクリッピング（0以上vocab_size未満に制限）
+            clipped_text = torch.clamp(text, 0, vocab_size - 1)
+            # 埋め込みを取得
+            token_embeddings = self.token_embedding(clipped_text)  # [batch, max_length, embed_dim]
+            
+            # エンコーダ出力とトークン埋め込みを連結
+            combined_features = torch.cat([resampled_encoder_out, token_embeddings], dim=-1)
+            
+            # 非流暢性ロジットを計算
+            dysfl_logits = self.dysfl_classifier(combined_features).squeeze(-1)
             
             # シグモイド関数で確率に変換
             dysfl_probs = self.sigmoid(dysfl_logits)
