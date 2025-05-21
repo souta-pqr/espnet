@@ -625,9 +625,15 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ] && ! [[ " ${skip_stages} " =~ [
             utils/copy_data_dir.sh --validate_opts --non-print data/"${dset}" "${data_feats}${_suf}/${dset}"
             rm -f ${data_feats}${_suf}/${dset}/{segments,wav.scp,reco2file_and_channel,reco2dur}
             
-            # Copy isdysfl file if it exists
-            if [ -f data/${dset}/isdysfl ]; then
-                cp data/${dset}/isdysfl ${data_feats}${_suf}/${dset}/
+            # Copy isdysfl_* files if they exist
+            if [ -f data/${dset}/isdysfl_filler ]; then
+                cp data/${dset}/isdysfl_filler ${data_feats}${_suf}/${dset}/
+            fi
+            if [ -f data/${dset}/isdysfl_disfluency ]; then
+                cp data/${dset}/isdysfl_disfluency ${data_feats}${_suf}/${dset}/
+            fi
+            if [ -f data/${dset}/isdysfl_interjection ]; then
+                cp data/${dset}/isdysfl_interjection ${data_feats}${_suf}/${dset}/
             fi
 
             # Copy reference text files if there is more than 1 reference
@@ -676,9 +682,15 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ] && ! [[ " ${skip_stages} " =~ [
             fi
             utils/copy_data_dir.sh --validate_opts --non-print data/"${dset}" "${data_feats}${_suf}/${dset}"
             
-            # Copy isdysfl file if it exists
-            if [ -f data/${dset}/isdysfl ]; then
-                cp data/${dset}/isdysfl ${data_feats}${_suf}/${dset}/
+            # Copy isdysfl_* files if they exist
+            if [ -f data/${dset}/isdysfl_filler ]; then
+                cp data/${dset}/isdysfl_filler ${data_feats}${_suf}/${dset}/
+            fi
+            if [ -f data/${dset}/isdysfl_disfluency ]; then
+                cp data/${dset}/isdysfl_disfluency ${data_feats}${_suf}/${dset}/
+            fi
+            if [ -f data/${dset}/isdysfl_interjection ]; then
+                cp data/${dset}/isdysfl_interjection ${data_feats}${_suf}/${dset}/
             fi
             
             if [ "${dset}" = "${train_set}" ] || [ "${dset}" = "${valid_set}" ]; then
@@ -724,8 +736,16 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ] && ! [[ " ${skip_stages} " =~ [
             fi
             # 1. Copy datadir
             utils/copy_data_dir.sh --validate_opts --non-print data/"${dset}" "${data_feats}${_suf}/${dset}"
-            if [ -f data/${dset}/isdysfl ]; then
-                cp data/${dset}/isdysfl ${data_feats}${_suf}/${dset}/
+            
+            # Copy isdysfl_* files if they exist
+            if [ -f data/${dset}/isdysfl_filler ]; then
+                cp data/${dset}/isdysfl_filler ${data_feats}${_suf}/${dset}/
+            fi
+            if [ -f data/${dset}/isdysfl_disfluency ]; then
+                cp data/${dset}/isdysfl_disfluency ${data_feats}${_suf}/${dset}/
+            fi
+            if [ -f data/${dset}/isdysfl_interjection ]; then
+                cp data/${dset}/isdysfl_interjection ${data_feats}${_suf}/${dset}/
             fi
 
             # Copy reference text files if there is more than 1 reference
@@ -778,9 +798,15 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ] && ! [[ " ${skip_stages} " =~ [
             fi
             utils/copy_data_dir.sh --validate_opts --non-print data/"${dset}" "${data_feats}${_suf}/${dset}"
             
-            # Copy isdysfl file if it exists
-            if [ -f data/${dset}/isdysfl ]; then
-                cp data/${dset}/isdysfl ${data_feats}${_suf}/${dset}/
+            # Copy isdysfl_* files if they exist
+            if [ -f data/${dset}/isdysfl_filler ]; then
+                cp data/${dset}/isdysfl_filler ${data_feats}${_suf}/${dset}/
+            fi
+            if [ -f data/${dset}/isdysfl_disfluency ]; then
+                cp data/${dset}/isdysfl_disfluency ${data_feats}${_suf}/${dset}/
+            fi
+            if [ -f data/${dset}/isdysfl_interjection ]; then
+                cp data/${dset}/isdysfl_interjection ${data_feats}${_suf}/${dset}/
             fi
 
             # Copy reference text files if there is more than 1 reference
@@ -867,31 +893,73 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ] && ! [[ " ${skip_stages} " =~ [
                 awk ' { if( NF != 1 ) print $0; } ' >"${data_feats}/${dset}/${ref_txt}"
         done
 
-        # Process isdysfl file if it exists
-        if [ -f "${data_feats}/org/${dset}/isdysfl" ]; then
-            # Filter isdysfl based on valid utterances
+        # Process isdysfl_* files if they exist
+        if [ -f "${data_feats}/org/${dset}/isdysfl_filler" ]; then
+            # Filter isdysfl_filler based on valid utterances
             if [ "${_feats_type}" = raw ]; then
                 # When using raw features, filter by utt2num_samples
-                <"${data_feats}/org/${dset}/isdysfl" \
+                <"${data_feats}/org/${dset}/isdysfl_filler" \
                     utils/filter_scp.pl "${data_feats}/${dset}/utt2num_samples" \
-                    >"${data_feats}/${dset}/isdysfl.tmp"
+                    >"${data_feats}/${dset}/isdysfl_filler.tmp"
             else
                 # When using extracted features, filter by feats_shape
-                <"${data_feats}/org/${dset}/isdysfl" \
+                <"${data_feats}/org/${dset}/isdysfl_filler" \
                     utils/filter_scp.pl "${data_feats}/${dset}/feats_shape" \
-                    >"${data_feats}/${dset}/isdysfl.tmp"
+                    >"${data_feats}/${dset}/isdysfl_filler.tmp"
             fi
             
             # Check if each line has at least 2 fields (utterance ID and at least one label)
-            <"${data_feats}/${dset}/isdysfl.tmp" \
-                awk 'NF >= 2 {print $0}' >"${data_feats}/${dset}/isdysfl"
+            <"${data_feats}/${dset}/isdysfl_filler.tmp" \
+                awk 'NF >= 2 {print $0}' >"${data_feats}/${dset}/isdysfl_filler"
             
-            rm "${data_feats}/${dset}/isdysfl.tmp"
+            rm "${data_feats}/${dset}/isdysfl_filler.tmp"
+        fi
+
+        if [ -f "${data_feats}/org/${dset}/isdysfl_disfluency" ]; then
+            # Filter isdysfl_disfluency based on valid utterances
+            if [ "${_feats_type}" = raw ]; then
+                # When using raw features, filter by utt2num_samples
+                <"${data_feats}/org/${dset}/isdysfl_disfluency" \
+                    utils/filter_scp.pl "${data_feats}/${dset}/utt2num_samples" \
+                    >"${data_feats}/${dset}/isdysfl_disfluency.tmp"
+            else
+                # When using extracted features, filter by feats_shape
+                <"${data_feats}/org/${dset}/isdysfl_disfluency" \
+                    utils/filter_scp.pl "${data_feats}/${dset}/feats_shape" \
+                    >"${data_feats}/${dset}/isdysfl_disfluency.tmp"
+            fi
+            
+            # Check if each line has at least 2 fields (utterance ID and at least one label)
+            <"${data_feats}/${dset}/isdysfl_disfluency.tmp" \
+                awk 'NF >= 2 {print $0}' >"${data_feats}/${dset}/isdysfl_disfluency"
+            
+            rm "${data_feats}/${dset}/isdysfl_disfluency.tmp"
+        fi
+
+        if [ -f "${data_feats}/org/${dset}/isdysfl_interjection" ]; then
+            # Filter isdysfl_interjection based on valid utterances
+            if [ "${_feats_type}" = raw ]; then
+                # When using raw features, filter by utt2num_samples
+                <"${data_feats}/org/${dset}/isdysfl_interjection" \
+                    utils/filter_scp.pl "${data_feats}/${dset}/utt2num_samples" \
+                    >"${data_feats}/${dset}/isdysfl_interjection.tmp"
+            else
+                # When using extracted features, filter by feats_shape
+                <"${data_feats}/org/${dset}/isdysfl_interjection" \
+                    utils/filter_scp.pl "${data_feats}/${dset}/feats_shape" \
+                    >"${data_feats}/${dset}/isdysfl_interjection.tmp"
+            fi
+            
+            # Check if each line has at least 2 fields (utterance ID and at least one label)
+            <"${data_feats}/${dset}/isdysfl_interjection.tmp" \
+                awk 'NF >= 2 {print $0}' >"${data_feats}/${dset}/isdysfl_interjection"
+            
+            rm "${data_feats}/${dset}/isdysfl_interjection.tmp"
         fi
 
         # fix_data_dir.sh leaves only utts which exist in all files
         utils/fix_data_dir.sh \
-            ${ref_text_files_str:+--utt_extra_files "${ref_text_files_str} isdysfl"} \
+            ${ref_text_files_str:+--utt_extra_files "${ref_text_files_str} isdysfl_filler isdysfl_disfluency isdysfl_interjection"} \
             "${data_feats}/${dset}"
     done
 
@@ -1288,12 +1356,26 @@ if [ ${stage} -le 10 ] && [ ${stop_stage} -ge 10 ] && ! [[ " ${skip_stages} " =~
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/${ref_text_files[$i]},${ref_text_names[$i]},text "
     done
 
-    # 追加: isdysflデータの読み込み設定
-    if [ -f "${_asr_train_dir}/isdysfl" ]; then
-        _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/isdysfl,isdysfl,text_int "
+    # 追加: 3種類の非流暢性データの読み込み設定
+    if [ -f "${_asr_train_dir}/isdysfl_filler" ]; then
+        _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/isdysfl_filler,isdysfl_filler,text_int "
     fi
-    if [ -f "${_asr_valid_dir}/isdysfl" ]; then
-        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/isdysfl,isdysfl,text_int "
+    if [ -f "${_asr_valid_dir}/isdysfl_filler" ]; then
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/isdysfl_filler,isdysfl_filler,text_int "
+    fi
+
+    if [ -f "${_asr_train_dir}/isdysfl_disfluency" ]; then
+        _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/isdysfl_disfluency,isdysfl_disfluency,text_int "
+    fi
+    if [ -f "${_asr_valid_dir}/isdysfl_disfluency" ]; then
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/isdysfl_disfluency,isdysfl_disfluency,text_int "
+    fi
+
+    if [ -f "${_asr_train_dir}/isdysfl_interjection" ]; then
+        _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/isdysfl_interjection,isdysfl_interjection,text_int "
+    fi
+    if [ -f "${_asr_valid_dir}/isdysfl_interjection" ]; then
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/isdysfl_interjection,isdysfl_interjection,text_int "
     fi
 
     # shellcheck disable=SC2046,SC2086
@@ -1407,15 +1489,32 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
             _opts+="--train_shape_file ${_split_dir}/${ref_text_names[$i]}_shape.${token_type} "
         done
         
-        # 追加: isdysflデータの読み込み設定（分割時）
-        if [ -f "${_asr_train_dir}/isdysfl" ]; then
-            # isdysflファイルも分割して使用する設定を追加
+        # 追加: 分割時の3種類の非流暢性データの読み込み設定
+        if [ -f "${_asr_train_dir}/isdysfl_filler" ]; then
             ${python} -m espnet2.bin.split_scps \
               --scps \
-                  "${_asr_train_dir}/isdysfl" \
+                  "${_asr_train_dir}/isdysfl_filler" \
               --num_splits "${num_splits_asr}" \
-              --output_dir "${_split_dir}/isdysfl_split"
-            _opts+="--train_data_path_and_name_and_type ${_split_dir}/isdysfl_split,isdysfl,text_int "
+              --output_dir "${_split_dir}/isdysfl_filler_split"
+            _opts+="--train_data_path_and_name_and_type ${_split_dir}/isdysfl_filler_split,isdysfl_filler,text_int "
+        fi
+        
+        if [ -f "${_asr_train_dir}/isdysfl_disfluency" ]; then
+            ${python} -m espnet2.bin.split_scps \
+              --scps \
+                  "${_asr_train_dir}/isdysfl_disfluency" \
+              --num_splits "${num_splits_asr}" \
+              --output_dir "${_split_dir}/isdysfl_disfluency_split"
+            _opts+="--train_data_path_and_name_and_type ${_split_dir}/isdysfl_disfluency_split,isdysfl_disfluency,text_int "
+        fi
+        
+        if [ -f "${_asr_train_dir}/isdysfl_interjection" ]; then
+            ${python} -m espnet2.bin.split_scps \
+              --scps \
+                  "${_asr_train_dir}/isdysfl_interjection" \
+              --num_splits "${num_splits_asr}" \
+              --output_dir "${_split_dir}/isdysfl_interjection_split"
+            _opts+="--train_data_path_and_name_and_type ${_split_dir}/isdysfl_interjection_split,isdysfl_interjection,text_int "
         fi
         
         _opts+="--multiple_iterator true "
@@ -1438,9 +1537,15 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
             _opts+="--train_shape_file ${asr_stats_dir}/train/${ref_text_names[$i]}_shape.${token_type} "
         done
         
-        # 追加: isdysflデータの読み込み設定
-        if [ -f "${_asr_train_dir}/isdysfl" ]; then
-            _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/isdysfl,isdysfl,text_int "
+        # 追加: 3種類の非流暢性データの読み込み設定（通常版）
+        if [ -f "${_asr_train_dir}/isdysfl_filler" ]; then
+            _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/isdysfl_filler,isdysfl_filler,text_int "
+        fi
+        if [ -f "${_asr_train_dir}/isdysfl_disfluency" ]; then
+            _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/isdysfl_disfluency,isdysfl_disfluency,text_int "
+        fi
+        if [ -f "${_asr_train_dir}/isdysfl_interjection" ]; then
+            _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/isdysfl_interjection,isdysfl_interjection,text_int "
         fi
     fi
 
@@ -1450,9 +1555,15 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
         _opts+="--valid_shape_file ${asr_stats_dir}/valid/${ref_text_names[$i]}_shape.${token_type} "
     done
     
-    # 追加: 検証用isdysflデータの読み込み設定
-    if [ -f "${_asr_valid_dir}/isdysfl" ]; then
-        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/isdysfl,isdysfl,text_int "
+    # 追加: 検証用3種類の非流暢性データの読み込み設定
+    if [ -f "${_asr_valid_dir}/isdysfl_filler" ]; then
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/isdysfl_filler,isdysfl_filler,text_int "
+    fi
+    if [ -f "${_asr_valid_dir}/isdysfl_disfluency" ]; then
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/isdysfl_disfluency,isdysfl_disfluency,text_int "
+    fi
+    if [ -f "${_asr_valid_dir}/isdysfl_interjection" ]; then
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/isdysfl_interjection,isdysfl_interjection,text_int "
     fi
 
     log "Generate '${asr_exp}/run.sh'. You can resume the process from stage 11 using this script"
@@ -1492,38 +1603,6 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
             --output_dir "${asr_exp}" \
             --allow_variable_data_keys true \
             ${_opts} ${asr_args}
-fi
-
-
-if [ -n "${download_model}" ]; then
-    log "Use ${download_model} for decoding and evaluation"
-    asr_exp="${expdir}/${download_model}"
-    mkdir -p "${asr_exp}"
-
-    # If the model already exists, you can skip downloading
-    espnet_model_zoo_download --unpack true "${download_model}" > "${asr_exp}/config.txt"
-
-    # Get the path of each file
-    _asr_model_file=$(<"${asr_exp}/config.txt" sed -e "s/.*'asr_model_file': '\([^']*\)'.*$/\1/")
-    _asr_train_config=$(<"${asr_exp}/config.txt" sed -e "s/.*'asr_train_config': '\([^']*\)'.*$/\1/")
-
-    # Create symbolic links
-    ln -sf "${_asr_model_file}" "${asr_exp}"
-    ln -sf "${_asr_train_config}" "${asr_exp}"
-    inference_asr_model=$(basename "${_asr_model_file}")
-
-    if [ "$(<${asr_exp}/config.txt grep -c lm_file)" -gt 0 ]; then
-        _lm_file=$(<"${asr_exp}/config.txt" sed -e "s/.*'lm_file': '\([^']*\)'.*$/\1/")
-        _lm_train_config=$(<"${asr_exp}/config.txt" sed -e "s/.*'lm_train_config': '\([^']*\)'.*$/\1/")
-
-        lm_exp="${expdir}/${download_model}/lm"
-        mkdir -p "${lm_exp}"
-
-        ln -sf "${_lm_file}" "${lm_exp}"
-        ln -sf "${_lm_train_config}" "${lm_exp}"
-        inference_lm=$(basename "${_lm_file}")
-    fi
-
 fi
 
 
@@ -1656,7 +1735,7 @@ if [ ${stage} -le 12 ] && [ ${stop_stage} -ge 12 ] && ! [[ " ${skip_stages} " =~
         for ref_txt in ${ref_text_files[@]}; do
             suffix=$(echo ${ref_txt} | sed 's/text//')
             # 非流暢性検出結果ファイルを追加
-            for f in token token_int score text dysfl_probs dysfl_preds; do
+            for f in token token_int score text dysfl_probs_filler dysfl_preds_filler dysfl_probs_disfluency dysfl_preds_disfluency dysfl_probs_interjection dysfl_preds_interjection; do
                 if [ -f "${_logdir}/output.1/1best_recog/${f}${suffix}" ]; then
                     for i in $(seq "${_nj}"); do
                         cat "${_logdir}/output.${i}/1best_recog/${f}${suffix}"
@@ -1664,7 +1743,6 @@ if [ ${stage} -le 12 ] && [ ${stop_stage} -ge 12 ] && ! [[ " ${skip_stages} " =~
                 fi
             done
         done
-
     done
 fi
 
@@ -1685,16 +1763,49 @@ if [ ${stage} -le 13 ] && [ ${stop_stage} -ge 13 ] && ! [[ " ${skip_stages} " =~
         _data="${data_feats}/${dset}"
         _dir="${asr_exp}/${inference_tag}/${dset}"
 
-        # 非流暢性検出結果の評価（参照ファイルが存在する場合）
-        if [ -f "${_data}/isdysfl" ] && [ -f "${_dir}/dysfl_preds" ]; then
-            log "Scoring disfluency detection for ${dset}..."
-            _dysfl_scoredir="${_dir}/score_dysfl"
+        # フィラーの評価
+        if [ -f "${_data}/isdysfl_filler" ] && [ -f "${_dir}/dysfl_preds_filler" ]; then
+            log "Scoring filler disfluency detection for ${dset}..."
+            _dysfl_scoredir="${_dir}/score_dysfl_filler"
             mkdir -p "${_dysfl_scoredir}"
             
             ${python} -m espnet2.bin.score_dysfl \
-                --pred "${_dir}/dysfl_preds" \
-                --ref "${_data}/isdysfl" \
-                --output "${_dysfl_scoredir}/result.txt"
+                --pred "${_dir}/dysfl_preds_filler" \
+                --ref "${_data}/isdysfl_filler" \
+                --output "${_dysfl_scoredir}/result.txt" \
+                --category "filler"
+            
+            # 結果を表示
+            cat "${_dysfl_scoredir}/result.txt"
+        fi
+
+        # 言い直しの評価
+        if [ -f "${_data}/isdysfl_disfluency" ] && [ -f "${_dir}/dysfl_preds_disfluency" ]; then
+            log "Scoring repair disfluency detection for ${dset}..."
+            _dysfl_scoredir="${_dir}/score_dysfl_disfluency"
+            mkdir -p "${_dysfl_scoredir}"
+            
+            ${python} -m espnet2.bin.score_dysfl \
+                --pred "${_dir}/dysfl_preds_disfluency" \
+                --ref "${_data}/isdysfl_disfluency" \
+                --output "${_dysfl_scoredir}/result.txt" \
+                --category "disfluency"
+            
+            # 結果を表示
+            cat "${_dysfl_scoredir}/result.txt"
+        fi
+
+        # 感動詞の評価
+        if [ -f "${_data}/isdysfl_interjection" ] && [ -f "${_dir}/dysfl_preds_interjection" ]; then
+            log "Scoring interjection disfluency detection for ${dset}..."
+            _dysfl_scoredir="${_dir}/score_dysfl_interjection"
+            mkdir -p "${_dysfl_scoredir}"
+            
+            ${python} -m espnet2.bin.score_dysfl \
+                --pred "${_dir}/dysfl_preds_interjection" \
+                --ref "${_data}/isdysfl_interjection" \
+                --output "${_dysfl_scoredir}/result.txt" \
+                --category "interjection"
             
             # 結果を表示
             cat "${_dysfl_scoredir}/result.txt"
