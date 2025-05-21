@@ -610,9 +610,13 @@ class Speech2Text:
                 else:
                     logging.warning(f"仮説 {i+1}: 処理できないタイプです: {type(hyp)}")
             
-            # 非流暢性情報を保存するインスタンス変数を初期化
-            self.dysfl_probs = [None] * len(nbest_hyps)
-            self.dysfl_preds = [None] * len(nbest_hyps)
+            # 各カテゴリの非流暢性情報を保存するインスタンス変数を初期化
+            self.dysfl_probs_filler = [None] * len(nbest_hyps)
+            self.dysfl_preds_filler = [None] * len(nbest_hyps)
+            self.dysfl_probs_disfluency = [None] * len(nbest_hyps)
+            self.dysfl_preds_disfluency = [None] * len(nbest_hyps)
+            self.dysfl_probs_interjection = [None] * len(nbest_hyps)
+            self.dysfl_preds_interjection = [None] * len(nbest_hyps)
             
             # テキストがある場合のみ予測処理
             if text_tensors:
@@ -636,18 +640,28 @@ class Speech2Text:
                     logging.info(f"非流暢性予測の入力: text={padded_text.shape}, lengths={text_lengths.shape}")
                     
                     # 非流暢性予測
-                    dysfl_probs, dysfl_preds = self.asr_model.predict_dysfl(
+                    dysfl_results = self.asr_model.predict_dysfl(
                         speech,
                         lengths,
                         padded_text,
                         text_lengths
                     )
                     
-                    # 結果をリストに保存（元の仮説インデックスを使用）
+                    # 3種類のカテゴリそれぞれの結果をリストに保存（元の仮説インデックスを使用）
                     for i, (idx, length) in enumerate(zip(orig_indices, text_lengths)):
-                        self.dysfl_probs[idx] = dysfl_probs[i, :length].detach().cpu()
-                        self.dysfl_preds[idx] = dysfl_preds[i, :length].detach().cpu()
-                        logging.info(f"非流暢性予測結果 {i} (元インデックス {idx}): probs={self.dysfl_probs[idx].shape}, preds={self.dysfl_preds[idx].shape}")
+                        # フィラー
+                        self.dysfl_probs_filler[idx] = dysfl_results["filler"][0][i, :length].detach().cpu()
+                        self.dysfl_preds_filler[idx] = dysfl_results["filler"][1][i, :length].detach().cpu()
+                        
+                        # 言い直し
+                        self.dysfl_probs_disfluency[idx] = dysfl_results["disfluency"][0][i, :length].detach().cpu() 
+                        self.dysfl_preds_disfluency[idx] = dysfl_results["disfluency"][1][i, :length].detach().cpu()
+                        
+                        # 感動詞
+                        self.dysfl_probs_interjection[idx] = dysfl_results["interjection"][0][i, :length].detach().cpu()
+                        self.dysfl_preds_interjection[idx] = dysfl_results["interjection"][1][i, :length].detach().cpu()
+                        
+                        logging.info(f"非流暢性予測結果 {i} (元インデックス {idx}): 3種類のカテゴリについて予測完了")
             else:
                 logging.warning("非流暢性予測をスキップ: テキストがありません")
             
@@ -661,6 +675,48 @@ class Speech2Text:
             
             # エラーが発生した場合は通常の結果を返す
             return nbest_hyps
+
+    def _write_dysfl_results(self):
+        """非流暢性検出結果をファイルに書き込む"""
+        # 出力先ディレクトリを取得
+        output_dir = self.output_dir / "1best_recog"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 結果があるか確認して書き込み
+        for i, (hyp, key) in enumerate(zip(self.results, self.keys)):
+            if i >= len(self.keys):
+                logging.warning(f"結果インデックス {i} が keys の範囲外です: {len(self.keys)}")
+                continue
+                
+            # フィラー結果の書き込み
+            if hasattr(self, "dysfl_probs_filler") and self.dysfl_probs_filler[0] is not None:
+                with open(output_dir / "dysfl_probs_filler", "a", encoding="utf-8") as f:
+                    probs_str = " ".join([f"{p.item():.6f}" for p in self.dysfl_probs_filler[0]])
+                    f.write(f"{key} {probs_str}\n")
+                    
+                with open(output_dir / "dysfl_preds_filler", "a", encoding="utf-8") as f:
+                    preds_str = " ".join([f"{int(p.item())}" for p in self.dysfl_preds_filler[0]])
+                    f.write(f"{key} {preds_str}\n")
+                    
+            # 言い直し結果の書き込み
+            if hasattr(self, "dysfl_probs_disfluency") and self.dysfl_probs_disfluency[0] is not None:
+                with open(output_dir / "dysfl_probs_disfluency", "a", encoding="utf-8") as f:
+                    probs_str = " ".join([f"{p.item():.6f}" for p in self.dysfl_probs_disfluency[0]])
+                    f.write(f"{key} {probs_str}\n")
+                    
+                with open(output_dir / "dysfl_preds_disfluency", "a", encoding="utf-8") as f:
+                    preds_str = " ".join([f"{int(p.item())}" for p in self.dysfl_preds_disfluency[0]])
+                    f.write(f"{key} {preds_str}\n")
+                    
+            # 感動詞結果の書き込み
+            if hasattr(self, "dysfl_probs_interjection") and self.dysfl_probs_interjection[0] is not None:
+                with open(output_dir / "dysfl_probs_interjection", "a", encoding="utf-8") as f:
+                    probs_str = " ".join([f"{p.item():.6f}" for p in self.dysfl_probs_interjection[0]])
+                    f.write(f"{key} {probs_str}\n")
+                    
+                with open(output_dir / "dysfl_preds_interjection", "a", encoding="utf-8") as f:
+                    preds_str = " ".join([f"{int(p.item())}" for p in self.dysfl_preds_interjection[0]])
+                    f.write(f"{key} {preds_str}\n")
 
     @typechecked
     def _decode_interctc(
@@ -858,13 +914,6 @@ def inference(
     max_seq_len: int,
     max_mask_parallel: int,
 ):
-    if batch_size > 1:
-        raise NotImplementedError("batch decoding is not implemented")
-    if word_lm_train_config is not None:
-        raise NotImplementedError("Word LM is not implemented")
-    if ngpu > 1:
-        raise NotImplementedError("only single GPU decoding is supported")
-
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s",
@@ -976,15 +1025,39 @@ def inference(
                             ibest_writer[f"text_spk{spk}"][key] = result[0]
                             
                         # 非流暢性検出結果があれば保存
-                        if hasattr(speech2text, "dysfl_probs") and hasattr(speech2text, "dysfl_preds"):
+                        if hasattr(speech2text, "dysfl_probs_filler") and hasattr(speech2text, "dysfl_preds_filler"):
                             idx = n - 1  # nbestのインデックス
-                            if idx < len(speech2text.dysfl_probs) and speech2text.dysfl_probs[idx] is not None:
-                                ibest_writer[f"dysfl_probs_spk{spk}"][key] = " ".join(
-                                    [f"{p.item():.6f}" for p in speech2text.dysfl_probs[idx]]
+                            if idx < len(speech2text.dysfl_probs_filler) and speech2text.dysfl_probs_filler[idx] is not None:
+                                ibest_writer[f"dysfl_probs_filler_spk{spk}"][key] = " ".join(
+                                    [f"{p.item():.6f}" for p in speech2text.dysfl_probs_filler[idx]]
                                 )
-                            if idx < len(speech2text.dysfl_preds) and speech2text.dysfl_preds[idx] is not None:
-                                ibest_writer[f"dysfl_preds_spk{spk}"][key] = " ".join(
-                                    [f"{int(p.item())}" for p in speech2text.dysfl_preds[idx]]
+                            if idx < len(speech2text.dysfl_preds_filler) and speech2text.dysfl_preds_filler[idx] is not None:
+                                ibest_writer[f"dysfl_preds_filler_spk{spk}"][key] = " ".join(
+                                    [f"{int(p.item())}" for p in speech2text.dysfl_preds_filler[idx]]
+                                )
+                                
+                        # 言い直し検出結果保存
+                        if hasattr(speech2text, "dysfl_probs_disfluency") and hasattr(speech2text, "dysfl_preds_disfluency"):
+                            idx = n - 1  # nbestのインデックス
+                            if idx < len(speech2text.dysfl_probs_disfluency) and speech2text.dysfl_probs_disfluency[idx] is not None:
+                                ibest_writer[f"dysfl_probs_disfluency_spk{spk}"][key] = " ".join(
+                                    [f"{p.item():.6f}" for p in speech2text.dysfl_probs_disfluency[idx]]
+                                )
+                            if idx < len(speech2text.dysfl_preds_disfluency) and speech2text.dysfl_preds_disfluency[idx] is not None:
+                                ibest_writer[f"dysfl_preds_disfluency_spk{spk}"][key] = " ".join(
+                                    [f"{int(p.item())}" for p in speech2text.dysfl_preds_disfluency[idx]]
+                                )
+                                
+                        # 感動詞検出結果保存
+                        if hasattr(speech2text, "dysfl_probs_interjection") and hasattr(speech2text, "dysfl_preds_interjection"):
+                            idx = n - 1  # nbestのインデックス
+                            if idx < len(speech2text.dysfl_probs_interjection) and speech2text.dysfl_probs_interjection[idx] is not None:
+                                ibest_writer[f"dysfl_probs_interjection_spk{spk}"][key] = " ".join(
+                                    [f"{p.item():.6f}" for p in speech2text.dysfl_probs_interjection[idx]]
+                                )
+                            if idx < len(speech2text.dysfl_preds_interjection) and speech2text.dysfl_preds_interjection[idx] is not None:
+                                ibest_writer[f"dysfl_preds_interjection_spk{spk}"][key] = " ".join(
+                                    [f"{int(p.item())}" for p in speech2text.dysfl_preds_interjection[idx]]
                                 )
 
             else:
@@ -1006,15 +1079,45 @@ def inference(
                         ibest_writer["text"][key] = result[0]
                         
                     # 非流暢性検出結果があれば保存
-                    if hasattr(speech2text, "dysfl_probs") and hasattr(speech2text, "dysfl_preds"):
+                    if hasattr(speech2text, "dysfl_probs_filler") and hasattr(speech2text, "dysfl_preds_filler"):
                         idx = n - 1  # nbestのインデックス
-                        if idx < len(speech2text.dysfl_probs) and speech2text.dysfl_probs[idx] is not None:
-                            ibest_writer["dysfl_probs"][key] = " ".join(
-                                [f"{p.item():.6f}" for p in speech2text.dysfl_probs[idx]]
+                        if (idx < len(speech2text.dysfl_probs_filler) and 
+                            speech2text.dysfl_probs_filler[idx] is not None):
+                            ibest_writer["dysfl_probs_filler"][key] = " ".join(
+                                [f"{p.item():.6f}" for p in speech2text.dysfl_probs_filler[idx]]
                             )
-                        if idx < len(speech2text.dysfl_preds) and speech2text.dysfl_preds[idx] is not None:
-                            ibest_writer["dysfl_preds"][key] = " ".join(
-                                [f"{int(p.item())}" for p in speech2text.dysfl_preds[idx]]
+                        if (idx < len(speech2text.dysfl_preds_filler) and 
+                            speech2text.dysfl_preds_filler[idx] is not None):
+                            ibest_writer["dysfl_preds_filler"][key] = " ".join(
+                                [f"{int(p.item())}" for p in speech2text.dysfl_preds_filler[idx]]
+                            )
+                            
+                    # 言い直し検出結果保存
+                    if hasattr(speech2text, "dysfl_probs_disfluency") and hasattr(speech2text, "dysfl_preds_disfluency"):
+                        idx = n - 1  # nbestのインデックス
+                        if (idx < len(speech2text.dysfl_probs_disfluency) and 
+                            speech2text.dysfl_probs_disfluency[idx] is not None):
+                            ibest_writer["dysfl_probs_disfluency"][key] = " ".join(
+                                [f"{p.item():.6f}" for p in speech2text.dysfl_probs_disfluency[idx]]
+                            )
+                        if (idx < len(speech2text.dysfl_preds_disfluency) and 
+                            speech2text.dysfl_preds_disfluency[idx] is not None):
+                            ibest_writer["dysfl_preds_disfluency"][key] = " ".join(
+                                [f"{int(p.item())}" for p in speech2text.dysfl_preds_disfluency[idx]]
+                            )
+                            
+                    # 感動詞検出結果保存
+                    if hasattr(speech2text, "dysfl_probs_interjection") and hasattr(speech2text, "dysfl_preds_interjection"):
+                        idx = n - 1  # nbestのインデックス
+                        if (idx < len(speech2text.dysfl_probs_interjection) and 
+                            speech2text.dysfl_probs_interjection[idx] is not None):
+                            ibest_writer["dysfl_probs_interjection"][key] = " ".join(
+                                [f"{p.item():.6f}" for p in speech2text.dysfl_probs_interjection[idx]]
+                            )
+                        if (idx < len(speech2text.dysfl_preds_interjection) and 
+                            speech2text.dysfl_preds_interjection[idx] is not None):
+                            ibest_writer["dysfl_preds_interjection"][key] = " ".join(
+                                [f"{int(p.item())}" for p in speech2text.dysfl_preds_interjection[idx]]
                             )
 
                 # Write intermediate predictions to
