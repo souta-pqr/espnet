@@ -4,11 +4,11 @@ import argparse
 import logging
 import numpy as np
 import sys
-from sklearn.metrics import precision_recall_fscore_support, accuracy_score, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 
 def get_parser():
     parser = argparse.ArgumentParser(
-        description="非流暢性検出結果の評価",
+        description="非流暢性検出結果の評価（4クラス分類）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--pred", type=str, required=True, help="予測ファイル")
@@ -17,6 +17,9 @@ def get_parser():
     return parser
 
 def main(args):
+    # クラス名の定義
+    class_names = ["Others", "Interjection", "Repair", "Filler"]
+    
     # 予測ファイルと参照ファイルを読み込む
     pred_dict = {}
     with open(args.pred, "r", encoding="utf-8") as f:
@@ -57,34 +60,76 @@ def main(args):
         all_preds.extend(pred)
         all_refs.extend(ref)
     
+    # NumPy配列に変換
+    all_preds = np.array(all_preds)
+    all_refs = np.array(all_refs)
+    
     # 評価指標を計算
     accuracy = accuracy_score(all_refs, all_preds)
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        all_refs, all_preds, average='binary', zero_division=0
+    
+    # クラスごとの詳細な評価指標
+    report = classification_report(
+        all_refs, all_preds, 
+        labels=[0, 1, 2, 3],
+        target_names=class_names,
+        output_dict=True
     )
     
     # 混同行列
-    tn, fp, fn, tp = confusion_matrix(all_refs, all_preds, labels=[0, 1]).ravel()
+    cm = confusion_matrix(all_refs, all_preds, labels=[0, 1, 2, 3])
     
     # 結果をファイルに書き込む
     with open(args.output, "w", encoding="utf-8") as f:
-        f.write("非流暢性検出結果\n")
+        f.write("非流暢性検出結果（4クラス分類）\n")
         f.write("==========================\n")
-        f.write(f"正解率: {accuracy:.4f}\n")
-        f.write(f"適合率: {precision:.4f}\n")
-        f.write(f"再現率: {recall:.4f}\n")
-        f.write(f"F1スコア: {f1:.4f}\n")
+        f.write(f"全体正解率: {accuracy:.4f}\n\n")
+        
+        f.write("クラスごとの評価指標:\n")
+        f.write("-" * 50 + "\n")
+        for i, class_name in enumerate(class_names):
+            if str(i) in report:
+                metrics = report[str(i)]
+                f.write(f"\n{class_name} (Class {i}):\n")
+                f.write(f"  適合率: {metrics['precision']:.4f}\n")
+                f.write(f"  再現率: {metrics['recall']:.4f}\n")
+                f.write(f"  F1スコア: {metrics['f1-score']:.4f}\n")
+                f.write(f"  サポート: {int(metrics['support'])}\n")
+        
         f.write("\n混同行列:\n")
-        f.write(f"真陰性: {tn}\n")
-        f.write(f"偽陽性: {fp}\n")
-        f.write(f"偽陰性: {fn}\n")
-        f.write(f"真陽性: {tp}\n")
+        f.write("-" * 50 + "\n")
+        f.write("    予測→  ")
+        for name in class_names:
+            f.write(f"{name[:6]:>8}")
+        f.write("\n")
+        f.write("真値↓\n")
+        for i, row in enumerate(cm):
+            f.write(f"{class_names[i]:<10}")
+            for val in row:
+                f.write(f"{val:>8}")
+            f.write("\n")
+        
+        # マクロ平均とマイクロ平均
+        f.write("\n全体的な評価指標:\n")
+        f.write("-" * 50 + "\n")
+        if 'macro avg' in report:
+            macro = report['macro avg']
+            f.write(f"マクロ平均 - 適合率: {macro['precision']:.4f}, "
+                   f"再現率: {macro['recall']:.4f}, "
+                   f"F1スコア: {macro['f1-score']:.4f}\n")
+        if 'weighted avg' in report:
+            weighted = report['weighted avg']
+            f.write(f"重み付き平均 - 適合率: {weighted['precision']:.4f}, "
+                   f"再現率: {weighted['recall']:.4f}, "
+                   f"F1スコア: {weighted['f1-score']:.4f}\n")
     
     # 標準出力にも結果を表示
-    logging.info(f"正解率: {accuracy:.4f}")
-    logging.info(f"適合率: {precision:.4f}")
-    logging.info(f"再現率: {recall:.4f}")
-    logging.info(f"F1スコア: {f1:.4f}")
+    logging.info(f"全体正解率: {accuracy:.4f}")
+    for i, class_name in enumerate(class_names):
+        if str(i) in report:
+            metrics = report[str(i)]
+            logging.info(f"{class_name}: F1={metrics['f1-score']:.4f}, "
+                        f"P={metrics['precision']:.4f}, "
+                        f"R={metrics['recall']:.4f}")
     
     return 0
 
@@ -92,6 +137,7 @@ if __name__ == "__main__":
     parser = get_parser()
     args = parser.parse_args()
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s"
+        level=logging.INFO, 
+        format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s"
     )
     sys.exit(main(args))
