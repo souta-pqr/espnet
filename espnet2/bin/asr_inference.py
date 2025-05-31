@@ -975,13 +975,24 @@ def inference(
                         if result[0] is not None:
                             ibest_writer[f"text_spk{spk}"][key] = result[0]
                             
-                        # 非流暢性検出結果があれば保存
+                        # 非流暢性検出結果があれば保存（4クラス分類版）
                         if hasattr(speech2text, "dysfl_probs") and hasattr(speech2text, "dysfl_preds"):
                             idx = n - 1  # nbestのインデックス
                             if idx < len(speech2text.dysfl_probs) and speech2text.dysfl_probs[idx] is not None:
-                                ibest_writer[f"dysfl_probs_spk{spk}"][key] = " ".join(
-                                    [f"{p.item():.6f}" for p in speech2text.dysfl_probs[idx]]
-                                )
+                                # 4クラス分類の場合、各クラスの確率を保存
+                                probs_list = []
+                                for token_probs in speech2text.dysfl_probs[idx]:
+                                    # 各トークンの4クラス分の確率を文字列に変換
+                                    if token_probs.dim() == 1 and token_probs.size(0) == 4:
+                                        # 4つの確率値をカンマ区切りで保存
+                                        probs_str = ",".join([f"{p.item():.6f}" for p in token_probs])
+                                        probs_list.append(probs_str)
+                                    else:
+                                        # 互換性のため、単一値の場合の処理
+                                        probs_list.append(f"{token_probs.item():.6f}")
+                                
+                                ibest_writer[f"dysfl_probs_spk{spk}"][key] = " ".join(probs_list)
+                                
                             if idx < len(speech2text.dysfl_preds) and speech2text.dysfl_preds[idx] is not None:
                                 ibest_writer[f"dysfl_preds_spk{spk}"][key] = " ".join(
                                     [f"{int(p.item())}" for p in speech2text.dysfl_preds[idx]]
@@ -1005,13 +1016,24 @@ def inference(
                     if result[0] is not None:
                         ibest_writer["text"][key] = result[0]
                         
-                    # 非流暢性検出結果があれば保存
+                    # 非流暢性検出結果があれば保存（4クラス分類版）
                     if hasattr(speech2text, "dysfl_probs") and hasattr(speech2text, "dysfl_preds"):
                         idx = n - 1  # nbestのインデックス
                         if idx < len(speech2text.dysfl_probs) and speech2text.dysfl_probs[idx] is not None:
-                            ibest_writer["dysfl_probs"][key] = " ".join(
-                                [f"{p.item():.6f}" for p in speech2text.dysfl_probs[idx]]
-                            )
+                            # 4クラス分類の場合、各クラスの確率を保存
+                            probs_list = []
+                            for token_probs in speech2text.dysfl_probs[idx]:
+                                # 各トークンの4クラス分の確率を文字列に変換
+                                if token_probs.dim() == 1 and token_probs.size(0) == 4:
+                                    # 4つの確率値をカンマ区切りで保存
+                                    probs_str = ",".join([f"{p.item():.6f}" for p in token_probs])
+                                    probs_list.append(probs_str)
+                                else:
+                                    # 互換性のため、単一値の場合の処理
+                                    probs_list.append(f"{token_probs.item():.6f}")
+                            
+                            ibest_writer["dysfl_probs"][key] = " ".join(probs_list)
+                            
                         if idx < len(speech2text.dysfl_preds) and speech2text.dysfl_preds[idx] is not None:
                             ibest_writer["dysfl_preds"][key] = " ".join(
                                 [f"{int(p.item())}" for p in speech2text.dysfl_preds[idx]]
