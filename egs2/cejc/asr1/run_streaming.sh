@@ -9,8 +9,8 @@ train_set=train_nodup
 valid_set=train_dev
 test_sets="eval"
 
-asr_config=myconf/train_asr_cbs_transducer_120303_12blk.yaml
-inference_config=myconf/decode_cbs_transducer.yaml
+asr_config=myconf/train_asr_cbs_transformer_081616_hop132.yaml
+inference_config=myconf/decode_asr_streaming.yaml
 
 asr_tag=0612_shoji_fid_mlt_token_dependency_mechanism_four_level_classification_twostage
 
