@@ -1,0 +1,234 @@
+# =========================================================
+# myconf/train_asr_cbs_transducer_120303_12blk_stage1.yaml
+# Stage 1用の設定ファイル（ASR学習）
+# =========================================================
+
+# Training configuration
+optim: adadelta
+optim_conf:
+    rho: 0.95
+    eps: 1.0e-8
+scheduler: exponentiallr
+scheduler_conf:
+    gamma: 0.9
+max_epoch: 70
+grad_clip: 5
+patience: null
+init: null
+best_model_criterion:
+-   - valid
+    - acc
+    - max
+keep_nbest_models: 10
+
+# Model configuration
+model: asr_model_with_path
+model_conf:
+    ctc_weight: 0.3
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    # Disfluency specific
+    disfluency_joint_space_size: 320
+    num_disfluency_classes: 4
+    freeze_asr_components: false
+    disfluency_weight: 1.0
+
+# Training stage
+training_stage: "asr"
+
+# Encoder
+encoder: rnn
+encoder_conf:
+    etype: blstm
+    elayers: 4
+    eunits: 320
+    eprojs: 320
+    dropout_rate: 0.1
+
+# Decoder (Predictor for RNN-T)
+decoder: rnn
+decoder_conf:
+    dtype: lstm
+    dlayers: 1
+    dunits: 320
+    dropout_rate: 0.1
+
+# Joint network
+joint_network: joint_network
+joint_network_conf:
+    joint_space_size: 320
+
+# Frontend
+frontend: default
+frontend_conf:
+    n_fft: 512
+    win_length: null
+    hop_length: 128
+
+# Specaugment
+specaug: specaug
+specaug_conf:
+    apply_time_warp: true
+    time_warp_window: 5
+    time_warp_mode: bicubic
+    apply_freq_mask: true
+    freq_mask_width_range:
+    - 0
+    - 30
+    num_freq_mask: 2
+    apply_time_mask: true
+    time_mask_width_range:
+    - 0
+    - 40
+    num_time_mask: 2
+
+# Normalization
+normalize: global_mvn
+normalize_conf:
+    stats_file: exp/asr_stats_raw_word_jp/train/feats_stats.npz
+
+# Batch configuration
+batch_type: numel
+batch_bins: 15000000
+accum_grad: 1
+num_workers: 2
+
+# =========================================================
+# myconf/train_asr_cbs_transducer_120303_12blk_stage2.yaml
+# Stage 2用の設定ファイル（非流暢性学習）
+# =========================================================
+
+# Training configuration
+optim: adam
+optim_conf:
+    lr: 0.0001
+    weight_decay: 0.000001
+scheduler: exponentiallr
+scheduler_conf:
+    gamma: 0.95
+max_epoch: 30
+grad_clip: 5
+patience: null
+best_model_criterion:
+-   - valid
+    - disfluency_acc
+    - max
+keep_nbest_models: 5
+
+# Model configuration
+model: asr_model_with_path
+model_conf:
+    ctc_weight: 0.3
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    # Disfluency specific - これらが重要
+    disfluency_joint_space_size: 320
+    num_disfluency_classes: 4
+    freeze_asr_components: true  # Stage2では必ずtrue
+    disfluency_weight: 1.0
+
+# Training stage
+training_stage: "disfluency"
+
+# 同じアーキテクチャを使用
+encoder: rnn
+encoder_conf:
+    etype: blstm
+    elayers: 4
+    eunits: 320
+    eprojs: 320
+    dropout_rate: 0.1
+
+decoder: rnn
+decoder_conf:
+    dtype: lstm
+    dlayers: 1
+    dunits: 320
+    dropout_rate: 0.1
+
+joint_network: joint_network
+joint_network_conf:
+    joint_space_size: 320
+
+# Frontend (同じ設定)
+frontend: default
+frontend_conf:
+    n_fft: 512
+    win_length: null
+    hop_length: 128
+
+# Stage2ではspecaugmentは使わない
+specaug: null
+
+# Normalization (同じ設定)
+normalize: global_mvn
+normalize_conf:
+    stats_file: exp/asr_stats_raw_word_jp/train/feats_stats.npz
+
+# Batch configuration (小さめに)
+batch_type: numel
+batch_bins: 8000000
+accum_grad: 2
+num_workers: 2
+
+# =========================================================
+# myconf/decode_cbs_transducer_disfluency.yaml  
+# デコード用設定ファイル
+# =========================================================
+
+# Beam search parameters
+beam_size: 20
+penalty: 0.0
+ctc_weight: 0.3
+max_sym_per_frame: 1
+
+# Post-processing
+remove_blank: true
+token_type: word
+bpemodel: null
+
+# Disfluency detection specific
+enable_disfluency_detection: true
+disfluency_threshold: 0.5
+
+# Batch configuration for inference
+batch_size: 1
+num_workers: 1
+
+# =========================================================
+# conf/train_lm.yaml (Language Model設定)
+# =========================================================
+
+# LM Training configuration  
+optim: adam
+optim_conf:
+    lr: 0.001
+    weight_decay: 0.0001
+
+scheduler: exponentiallr
+scheduler_conf:
+    gamma: 0.95
+
+max_epoch: 50
+grad_clip: 5.0
+patience: 3
+
+# Model configuration
+model: seq_rnn_lm
+model_conf:
+    unit: 650
+    nlayers: 2
+    dropout_rate: 0.5
+
+# Dataset configuration
+dataset_conf:
+    batch_size: 64
+    maxlen_in: 512
+    maxlen_out: 512
+
+# Batch configuration
+batch_type: sorted
+batch_size: 64
+sort_in_batch: descending
+sort_batch: descending
+num_workers: 2

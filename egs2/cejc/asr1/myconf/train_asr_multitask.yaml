@@ -1,0 +1,87 @@
+# network architecture
+# encoder related
+encoder: contextual_block_transformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 12
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d
+    block_size: 1600
+    hop_size: 640
+    look_ahead: 2
+
+# decoder related
+decoder: transformer
+decoder_conf:
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 6
+    dropout_rate: 0.1
+
+# multitask model settings
+model: espnet
+model_conf:
+    ctc_weight: 0.3
+    disfluency_weight: 1.0  # 非流暢性検出の重み
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    report_cer: True
+    report_wer: True
+
+# frontend settings
+frontend: default
+frontend_conf:
+    n_fft: 512
+    hop_length: 128
+    win_length: 512
+    fs: 16k
+
+# minibatch related
+batch_type: folded
+batch_size: 64
+accum_grad: 2
+grad_clip: 5
+max_epoch: 50
+
+# optimization related
+optim: adam
+optim_conf:
+    lr: 0.001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 25000
+
+# other settings
+best_model_criterion:
+-   - valid
+    - acc
+    - max
+keep_nbest_models: 10
+patience: none
+init: xavier_uniform
+
+# specaug settings
+specaug: specaug
+specaug_conf:
+    apply_time_warp: true
+    time_warp_window: 5
+    time_warp_mode: bicubic
+    apply_freq_mask: true
+    freq_mask_width_range:
+    - 0
+    - 30
+    num_freq_mask: 2
+    apply_time_mask: true
+    time_mask_width_range:
+    - 0
+    - 40
+    num_time_mask: 2
+
+# normalize
+normalize: global_mvn
+normalize_conf:
+    stats_file: exp/asr_stats_raw_jp_word/train/feats_stats.npz

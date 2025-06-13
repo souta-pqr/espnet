@@ -1,0 +1,22 @@
+# 基本設定は既存のyamlファイルを継承
+inheriting_files: ["myconf/train_asr_cbs_transducer_081616_hop132.yaml"]
+
+# 追加設定
+frontend: default
+frontend_conf:
+    hop_length: 640  # StreamingのためのHop size
+
+encoder: contextual_block_transformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 12
+    block_size: 1600  # Streaming用のブロックサイズ
+    hop_size: 640     # Streamingのためのホップサイズ
+
+decoder: transformer
+decoder_conf:
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 6

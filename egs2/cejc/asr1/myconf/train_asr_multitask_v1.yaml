@@ -1,0 +1,79 @@
+# network architecture
+encoder: contextual_block_transformer
+encoder_conf:
+    output_size: 256    # 論文の設定に合わせて
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 12
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d
+    block_size: 1600    # 論文のストリーミング設定
+    hop_size: 640
+    look_ahead: 2
+
+decoder: transformer_multitask
+decoder_conf:
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 6
+    dropout_rate: 0.1
+    token_dependency: true    # token-dependency機構の有効化
+    positional_encoding: true
+
+model: asr_multitask    # マルチタスクモデル
+model_conf:
+    ctc_weight: 0.3
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    report_cer: true
+    report_wer: true
+    joint_config:   # 非流暢性検出のための設定
+        token_weight: 1.0
+        disfluency_weight: 1.0
+        beam_alpha: 1.0    # 式(4)のα
+
+frontend: default
+frontend_conf:
+    n_fft: 512
+    hop_length: 128
+    win_length: 512
+    fs: 16k
+
+# 学習関連
+batch_type: folded
+batch_size: 32    # 論文の設定
+accum_grad: 2
+grad_clip: 5
+max_epoch: 50
+
+optim: adam
+optim_conf:
+    lr: 0.001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 25000
+
+# その他設定
+best_model_criterion:
+-   - valid
+    - acc
+    - max
+keep_nbest_models: 10
+
+specaug: specaug    # データ拡張
+specaug_conf:
+    apply_time_warp: true
+    time_warp_window: 5
+    time_warp_mode: bicubic
+    apply_freq_mask: true
+    freq_mask_width_range:
+    - 0
+    - 30
+    num_freq_mask: 2
+    apply_time_mask: true
+    time_mask_width_range:
+    - 0
+    - 40
+    num_time_mask: 2

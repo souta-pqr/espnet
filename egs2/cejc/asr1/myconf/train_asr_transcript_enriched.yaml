@@ -1,0 +1,13 @@
+# 既存の設定を継承
+inherit: myconf/train_asr_cbs_transducer_081616_hop132.yaml
+
+# Transcript-enriched固有の設定
+model_conf:
+    ctc_conf:
+        # <dysfl>タグをvocabularyに追加
+        additional_tokens: ["<dysfl>", "</dysfl>"]
+    decoder_conf:
+        # デコーダの設定
+        type: transformer
+        num_blocks: 6
+        attention_heads: 4
