@@ -9,7 +9,7 @@ train_set=train_nodup
 valid_set=train_dev
 test_sets="eval"
 
-asr_config=myconf/train_asr_cbs_transformer.yaml
+asr_config=myconf/train_asr_streaming_conformer.yaml
 inference_config=myconf/decode_asr_streaming.yaml
 
 asr_tag=0616_multi_transformer
