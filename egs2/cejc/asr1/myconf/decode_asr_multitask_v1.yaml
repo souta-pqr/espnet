@@ -1,0 +1,18 @@
+beam_size: 20
+penalty: 0.0
+maxlenratio: 0.0
+minlenratio: 0.0
+ctc_weight: 0.3
+lm_weight: 0.0
+
+# ストリーミング設定
+streaming: true
+streaming_conf:
+    block_size: 1600
+    hop_size: 640  
+    look_ahead: 2
+
+# 非流暢性検出用の設定
+disfluency_config:
+    beam_alpha: 1.0    # 論文の式(4)のα
+    threshold: 0.5     # 非流暢性判定の閾値

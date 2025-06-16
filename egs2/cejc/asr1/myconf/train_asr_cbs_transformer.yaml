@@ -1,0 +1,139 @@
+# network architecture
+# encoder related
+encoder: contextual_block_conformer    # contextual_block_conformer is the core of streaming conformer
+encoder_conf:
+    output_size: 256    # dimension of attention
+    attention_heads: 4
+    linear_units: 2048  # the number of units of position-wise feed forward
+    num_blocks: 12     # the number of encoder blocks
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.0
+    input_layer: conv2d # encoder architecture type
+    normalize_before: true
+    activation_type: swish
+    macaron_style: true
+    use_cnn_module: true
+    cnn_module_kernel: 15
+    block_size: 18      # streaming configuration
+    hop_size: 3         # streaming configuration
+    look_ahead:  3      # streaming configuration
+    init_average: true  # streaming configuration
+    ctx_pos_enc: true   # streaming configuration
+
+# decoder related
+decoder: disfluency_transformer
+decoder_conf:
+    # vocab_size will be automatically set from token_list
+    # IMPORTANT: Do not set vocab_size manually
+    encoder_output_size: 256
+    attention_heads: 4
+    linear_units: 2048
+    num_blocks: 6
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    self_attention_dropout_rate: 0.0
+    src_attention_dropout_rate: 0.0
+    input_layer: "embed"
+    use_output_layer: true
+    use_disfluency_layer: true  # Enable disfluency detection
+    num_disfluency_classes: 4  # 0: fluent, 1: filler, 2: repetition, 3: interjection
+    normalize_before: true
+    concat_after: false
+
+# CTC configuration (optional, disable if not needed)
+# ctc: ctc
+# ctc_conf:
+#     dropout_rate: 0.0
+#     ctc_type: builtin
+#     reduce: true
+
+model: disfluency_espnet  # Use the new disfluency-enabled model
+model_conf:
+    ctc_weight: 0.0  # Set to 0.0 to disable CTC, use only attention + disfluency
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    disfluency_weight: 1.0  # Weight for disfluency detection loss
+    report_cer: true
+    report_wer: true
+    # Extract features during stats collection
+    extract_feats_in_collect_stats: true
+
+# Frontend configuration
+frontend: default
+frontend_conf:
+    hop_length: 132
+
+# Preprocessing configuration
+preprocess_conf:
+    # These should match your data preprocessing
+    train_data_type: "sound"
+    valid_data_type: "sound"
+
+# Optimization configuration
+optim: adam
+optim_conf:
+    lr: 0.002
+    weight_decay: 0.000001
+
+scheduler: warmuplr     # pytorch v1.1.0+ required
+scheduler_conf:
+    warmup_steps: 25000
+
+# Training configuration
+max_epoch: 50
+patience: 10
+val_scheduler_criterion:
+    - valid
+    - loss
+best_model_criterion:
+    - valid
+    - loss
+    - min
+keep_nbest_models: 10
+
+# Batch configuration
+batch_type: numel
+batch_bins: 800000 
+accum_grad: 8
+grad_clip: 5
+grad_noise: false
+num_workers: 2
+
+# Data augmentation
+specaug: specaug
+specaug_conf:
+    apply_time_warp: true
+    time_warp_window: 5
+    time_warp_mode: bicubic
+    apply_freq_mask: true
+    freq_mask_width_range:
+    - 0
+    - 30
+    num_freq_mask: 2
+    apply_time_mask: true
+    time_mask_width_range:
+    - 0
+    - 40
+    num_time_mask: 2
+
+# Required for proper initialization
+required_data_names:
+    - speech
+    - text
+    - isdysfl  # Add disfluency labels
+
+# Additional disfluency-specific configurations
+disfluency_conf:
+    enable_disfluency_detection: true
+    disfluency_classes:
+        0: "fluent"
+        1: "filler"
+        2: "repetition" 
+        3: "interjection"
+
+# Seed for reproducibility
+seed: 30
+
+# Number of attention plots (set to 0 for faster training)
+num_att_plot: 0

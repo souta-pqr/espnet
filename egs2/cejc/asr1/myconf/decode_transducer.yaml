@@ -1,0 +1,11 @@
+beam_size: 20
+lm_weight: 0.0
+penalty: 0.0
+maxlenratio: 0.0
+minlenratio: 0.0
+beam_search_config:
+    search_type: default
+    score_norm: true
+streaming: true
+left_context: 32
+display_hypotheses: true

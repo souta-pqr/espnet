@@ -1,0 +1,92 @@
+# Stage 1: ASR Training with Contextual Block Conformer
+# encoder related
+encoder: contextual_block_conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 2048
+    num_blocks: 12
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.0
+    input_layer: conv2d
+    normalize_before: true
+    activation_type: swish
+    macaron_style: true
+    use_cnn_module: true
+    cnn_module_kernel: 15
+    block_size: 18
+    hop_size: 3
+    look_ahead: 3
+    init_average: true
+    ctx_pos_enc: true
+
+# decoder related
+decoder: transducer
+decoder_conf:
+    rnn_type: lstm
+    num_layers: 1
+    hidden_size: 512
+    dropout: 0.1
+    dropout_embed: 0.2
+
+joint_net_conf:
+    joint_space_size: 640
+
+# Model configuration for disfluency detection
+model: asr_model_with_path
+model_conf:
+    ctc_weight: 0.0
+    report_cer: true
+    report_wer: true
+    dysfl_weight: 1.0
+    num_dysfl_classes: 4
+    # Stage 1 specific
+    training_stage: "asr"
+    freeze_asr_components: false
+    disfluency_joint_space_size: 320
+    enable_viterbi_path: true  # Enable Viterbi path generation
+
+# Frontend
+frontend: default
+frontend_conf:
+    hop_length: 132
+
+# Optimization
+batch_type: numel
+batch_bins: 800000
+accum_grad: 8
+grad_clip: 5
+patience: 10
+max_epoch: 50
+best_model_criterion:
+-   - valid
+    - cer_transducer
+    - min
+keep_nbest_models: 10
+
+optim: adam
+optim_conf:
+    lr: 0.002
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 25000
+
+# Specaugment for Stage 1
+specaug: specaug
+specaug_conf:
+    apply_time_warp: true
+    time_warp_window: 5
+    time_warp_mode: bicubic
+    apply_freq_mask: true
+    freq_mask_width_range:
+    - 0
+    - 30
+    num_freq_mask: 2
+    apply_time_mask: true
+    time_mask_width_range:
+    - 0
+    - 40
+    num_time_mask: 2
+
+seed: 30
