@@ -1,6 +1,6 @@
 # network architecture
 # encoder related
-encoder: contextual_block_transformer
+encoder: contextual_block_conformer
 encoder_conf:
     output_size: 256    # dimension of attention
     attention_heads: 4
