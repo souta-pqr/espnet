@@ -32,7 +32,8 @@ decoder_conf:
     self_attention_dropout_rate: 0.0
     src_attention_dropout_rate: 0.0
     # Disfluency-specific settings
-    disfluency_dim: 4
+    disfluency_classes: 4
+    disfluency_weight: 1.0
 
 # hybrid CTC/attention
 model_conf:
@@ -63,8 +64,8 @@ max_epoch: 50
 #     - acc
 best_model_criterion:
 -   - valid
-    - acc
-    - max
+    - cer
+    - min
 # early_stopping_criterion:
 #     - valid
 #     - cer_ctc

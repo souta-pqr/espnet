@@ -12,7 +12,7 @@ test_sets="eval"
 asr_config=myconf/train_asr_streaming_conformer_multitask.yaml
 inference_config=myconf/decode_asr_streaming.yaml
 
-asr_tag=0616_multi_transformer
+asr_tag=0622_multitask_transformer_+csj_hatuon
 
 # LM settings
 lm_config=conf/train_lm.yaml
@@ -38,4 +38,7 @@ use_lm=false
     --valid_set "${valid_set}"                         \
     --test_sets "${test_sets}"                         \
     --lm_train_text "data/${train_set}/text"           \
+    --use_lm false                                     \
+    --use_word_lm false                                \
+    --inference_asr_model valid.cer.best.pth           \
     "$@"

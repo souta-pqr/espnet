@@ -165,6 +165,13 @@ asr_speech_fold_length=800 # fold_length for speech data during ASR training.
 asr_text_fold_length=150   # fold_length for text data during ASR training.
 lm_fold_length=150         # fold_length for LM training.
 
+# Disfluency detection related
+use_disfluency_detection=true    # Whether to use disfluency detection
+disfluency_weight=1.0            # Weight for disfluency detection loss
+disfluency_classes=4             # Number of disfluency classes (0:fluent, 1:filler, 2:repetition, 3:interjection)
+report_disfluency_accuracy=true # Report disfluency detection accuracy
+disfluency_task=asr             # Task type for disfluency: "asr" or "disfluency_asr"
+
 help_message=$(cat << EOF
 Usage: $0 --train-set "<train_set_name>" --valid-set "<valid_set_name>" --test_sets "<test_set_names>"
 
@@ -539,6 +546,14 @@ if [ -z "${inference_tag}" ]; then
       inference_tag+="_k2_ctc_decoding_${k2_ctc_decoding}"
       inference_tag+="_use_nbest_rescoring_${use_nbest_rescoring}"
     fi
+fi
+
+# Set the correct task based on disfluency settings
+if "${use_disfluency_detection}"; then
+    disfluency_task=disfluency_asr
+    log "Using disfluency ASR task"
+else
+    disfluency_task=asr
 fi
 
 if "${skip_data_prep}"; then
@@ -1282,7 +1297,6 @@ if [ ${stage} -le 10 ] && [ ${stop_stage} -ge 10 ] && ! [[ " ${skip_stages} " =~
     mkdir -p "${asr_stats_dir}"; echo "${run_args} --stage 10 \"\$@\"; exit \$?" > "${asr_stats_dir}/run.sh"; chmod +x "${asr_stats_dir}/run.sh"
 
     # 3. Submit jobs
-    log "ASR collect-stats started... log: '${_logdir}/stats.*.log'"
 
     # NOTE: --*_shape_file doesn't require length information if --batch_type=unsorted,
     #       but it's used only for deciding the sample ids.
@@ -1294,6 +1308,19 @@ if [ ${stage} -le 10 ] && [ ${stop_stage} -ge 10 ] && ! [[ " ${skip_stages} " =~
         _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/${ref_text_files[$i]},${ref_text_names[$i]},text "
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/${ref_text_files[$i]},${ref_text_names[$i]},text "
     done
+    
+    # Add disfluency data if available and disfluency detection is enabled
+    if "${use_disfluency_detection}"; then
+        if [ -f "${_asr_train_dir}/isdysfl" ] && [ -f "${_asr_valid_dir}/isdysfl" ]; then
+            log "Adding disfluency labels for training"
+            _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/isdysfl,isdysfl,text "
+            _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/isdysfl,isdysfl,text "
+        else
+            log "Warning: Disfluency detection enabled but isdysfl files not found"
+            log "Expected: ${_asr_train_dir}/isdysfl and ${_asr_valid_dir}/isdysfl"
+        fi
+    fi
+    
     if ${use_prompt}; then
         _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/prompt,prompt,text "
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/prompt,prompt,text "
@@ -1301,9 +1328,21 @@ if [ ${stage} -le 10 ] && [ ${stop_stage} -ge 10 ] && ! [[ " ${skip_stages} " =~
         _opts+="--use_nlp_prompt ${use_nlp_prompt} "
     fi
 
+    # Add disfluency-specific options
+    if "${use_disfluency_detection}"; then
+        _opts+="--disfluency_weight ${disfluency_weight} "
+        _opts+="--disfluency_classes ${disfluency_classes} "
+        _opts+="--report_disfluency_accuracy ${report_disfluency_accuracy} "
+        _opts+="--use_disfluency_detection ${use_disfluency_detection} "
+        
+        log "ASR collect-stats with disfluency detection started... log: '${_logdir}/stats.*.log'"
+    else
+        log "ASR collect-stats started... log: '${_logdir}/stats.*.log'"
+    fi
+
     # shellcheck disable=SC2046,SC2086
     ${train_cmd} JOB=1:"${_nj}" "${_logdir}"/stats.JOB.log \
-        ${python} -m espnet2.bin.${asr_task}_train \
+        ${python} -m espnet2.bin.${disfluency_task}_train \
             --collect_stats true \
             --use_preprocessor true \
             --bpemodel "${bpemodel}" \
@@ -1340,6 +1379,19 @@ if [ ${stage} -le 10 ] && [ ${stop_stage} -ge 10 ] && ! [[ " ${skip_stages} " =~
             awk -v N="$(<${token_list} wc -l)" '{ print $0 "," N }' \
             >"${asr_stats_dir}/valid/${ref_txt}_shape.${token_type}"
     done
+    
+    # Process disfluency shape files if available
+    if "${use_disfluency_detection}"; then
+        if [ -f "${asr_stats_dir}/train/isdysfl_shape" ]; then
+            <"${asr_stats_dir}/train/isdysfl_shape" \
+                awk -v N="${disfluency_classes}" '{ print $0 "," N }' \
+                >"${asr_stats_dir}/train/isdysfl_shape.disfluency"
+
+            <"${asr_stats_dir}/valid/isdysfl_shape" \
+                awk -v N="${disfluency_classes}" '{ print $0 "," N }' \
+                >"${asr_stats_dir}/valid/isdysfl_shape.disfluency"
+        fi
+    fi
 fi
 
 
@@ -1390,12 +1442,16 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
         _split_dir="${asr_stats_dir}/splits${num_splits_asr}"
         if [ ! -f "${_split_dir}/.done" ]; then
             rm -f "${_split_dir}/.done"
+            
+            _split_scps="${_asr_train_dir}/${_scp} ${_asr_train_dir}/text ${asr_stats_dir}/train/speech_shape ${asr_stats_dir}/train/text_shape.${token_type}"
+            
+            # Add disfluency files to split if available
+            if "${use_disfluency_detection}" && [ -f "${_asr_train_dir}/isdysfl" ]; then
+                _split_scps+=" ${_asr_train_dir}/isdysfl ${asr_stats_dir}/train/isdysfl_shape.disfluency"
+            fi
+            
             ${python} -m espnet2.bin.split_scps \
-              --scps \
-                  "${_asr_train_dir}/${_scp}" \
-                  "${_asr_train_dir}/text" \
-                  "${asr_stats_dir}/train/speech_shape" \
-                  "${asr_stats_dir}/train/text_shape.${token_type}" \
+              --scps ${_split_scps} \
               --num_splits "${num_splits_asr}" \
               --output_dir "${_split_dir}"
             touch "${_split_dir}/.done"
@@ -1411,6 +1467,13 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
             _opts+="--train_data_path_and_name_and_type ${_split_dir}/${ref_text_files[$i]},${ref_text_names[$i]},text "
             _opts+="--train_shape_file ${_split_dir}/${ref_text_names[$i]}_shape.${token_type} "
         done
+        
+        # Add disfluency data to splits
+        if "${use_disfluency_detection}" && [ -f "${_split_dir}/isdysfl" ]; then
+            _opts+="--train_data_path_and_name_and_type ${_split_dir}/isdysfl,isdysfl,text "
+            _opts+="--train_shape_file ${_split_dir}/isdysfl_shape.disfluency "
+        fi
+        
         _opts+="--multiple_iterator true "
 
     else
@@ -1430,6 +1493,14 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
             _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/${ref_text_files[$i]},${ref_text_names[$i]},text "
             _opts+="--train_shape_file ${asr_stats_dir}/train/${ref_text_names[$i]}_shape.${token_type} "
         done
+        
+        # Add disfluency data if available and disfluency detection is enabled
+        if "${use_disfluency_detection}"; then
+            if [ -f "${_asr_train_dir}/isdysfl" ]; then
+                _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/isdysfl,isdysfl,text "
+                _opts+="--train_shape_file ${asr_stats_dir}/train/isdysfl_shape.disfluency "
+            fi
+        fi
     fi
 
     # shellcheck disable=SC2068
@@ -1437,6 +1508,15 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/${ref_text_files[$i]},${ref_text_names[$i]},text "
         _opts+="--valid_shape_file ${asr_stats_dir}/valid/${ref_text_names[$i]}_shape.${token_type} "
     done
+    
+    # Add disfluency validation data
+    if "${use_disfluency_detection}"; then
+        if [ -f "${_asr_valid_dir}/isdysfl" ]; then
+            _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/isdysfl,isdysfl,text "
+            _opts+="--valid_shape_file ${asr_stats_dir}/valid/isdysfl_shape.disfluency "
+        fi
+    fi
+    
     if ${use_prompt}; then
         _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/prompt,prompt,text "
         _opts+="--train_shape_file ${asr_stats_dir}/train/prompt_shape "
@@ -1445,11 +1525,23 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
         _opts+="--use_lang_prompt ${use_lang_prompt} "
         _opts+="--use_nlp_prompt ${use_nlp_prompt} "
     fi
+
+    # Add disfluency-specific options
+    if "${use_disfluency_detection}"; then
+        _opts+="--disfluency_weight ${disfluency_weight} "
+        _opts+="--disfluency_classes ${disfluency_classes} "
+        _opts+="--report_disfluency_accuracy ${report_disfluency_accuracy} "
+        _opts+="--use_disfluency_detection ${use_disfluency_detection} "
+        
+        log "ASR training with disfluency detection started... log: '${asr_exp}/train.log'"
+    else
+        log "ASR training started... log: '${asr_exp}/train.log'"
+    fi
+    
     log "Generate '${asr_exp}/run.sh'. You can resume the process from stage 11 using this script"
     mkdir -p "${asr_exp}"; echo "${run_args} --stage 11 \"\$@\"; exit \$?" > "${asr_exp}/run.sh"; chmod +x "${asr_exp}/run.sh"
 
     # NOTE(kamo): --fold_length is used only if --batch_type=folded and it's ignored in the other case
-    log "ASR training started... log: '${asr_exp}/train.log'"
     if echo "${cuda_cmd}" | grep -e queue.pl -e queue-freegpu.pl &> /dev/null; then
         # SGE can't include "/" in a job name
         jobname="$(basename ${asr_exp})"
@@ -1468,7 +1560,7 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
             "${asr_exp}"/train.log \
             srun --export=ALL \
             ${python} -m espnet2.bin.lightning_train \
-                --task asr \
+                --task ${disfluency_task} \
                 --lightning_conf "{devices: ${ngpu}, num_nodes: ${num_nodes}, default_root_dir: ${asr_exp}}" \
                 --use_preprocessor true \
                 --bpemodel "${bpemodel}" \
@@ -1496,7 +1588,7 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
             --num_nodes "${num_nodes}" \
             --init_file_prefix "${asr_exp}"/.dist_init_ \
             --multiprocessing_distributed true -- \
-            ${python} -m espnet2.bin.${asr_task}_train \
+            ${python} -m espnet2.bin.${disfluency_task}_train \
                 --use_preprocessor true \
                 --bpemodel "${bpemodel}" \
                 --token_type "${token_type}" \
@@ -1576,12 +1668,18 @@ if [ ${stage} -le 12 ] && [ ${stop_stage} -ge 12 ] && ! [[ " ${skip_stages} " =~
          _opts+="--ngram_file ${ngram_exp}/${inference_ngram}"
     fi
 
+    # Add disfluency-specific inference options
+    if "${use_disfluency_detection}"; then
+        _opts+="--disfluency_weight ${disfluency_weight} "
+        _opts+="--output_disfluency true "
+    fi
+
     # 2. Generate run.sh
     log "Generate '${asr_exp}/${inference_tag}/run.sh'. You can resume the process from stage 12 using this script"
     mkdir -p "${asr_exp}/${inference_tag}"; echo "${run_args} --stage 12 \"\$@\"; exit \$?" > "${asr_exp}/${inference_tag}/run.sh"; chmod +x "${asr_exp}/${inference_tag}/run.sh"
 
     inference_bin_tag=""
-    if [ ${asr_task} == "asr" ]; then
+    if [ ${disfluency_task} == "asr" ]; then
         if "${use_k2}"; then
             # Now only _nj=1 is verified if using k2
             inference_bin_tag="_k2"
@@ -1603,6 +1701,7 @@ if [ ${stage} -le 12 ] && [ ${stop_stage} -ge 12 ] && ! [[ " ${skip_stages} " =~
     else
         _dsets="${test_sets}"
     fi
+    
     for dset in ${_dsets}; do
         _data="${data_feats}/${dset}"
         _dir="${asr_exp}/${inference_tag}/${dset}"
@@ -1642,11 +1741,16 @@ if [ ${stage} -le 12 ] && [ ${stop_stage} -ge 12 ] && ! [[ " ${skip_stages} " =~
         utils/split_scp.pl "${key_file}" ${split_scps}
 
         # 2. Submit decoding jobs
-        log "Decoding started... log: '${_logdir}/asr_inference.*.log'"
+        if "${use_disfluency_detection}"; then
+            log "Disfluency-aware decoding started... log: '${_logdir}/asr_inference.*.log'"
+        else
+            log "Decoding started... log: '${_logdir}/asr_inference.*.log'"
+        fi
+        
         rm -f "${_logdir}/*.log"
         # shellcheck disable=SC2046,SC2086
         ${_cmd} --gpu "${_ngpu}" JOB=1:"${_nj}" "${_logdir}"/asr_inference.JOB.log \
-            ${python} -m espnet2.bin.${asr_task}_inference${inference_bin_tag} \
+            ${python} -m espnet2.bin.${disfluency_task}_inference${inference_bin_tag} \
                 --batch_size ${batch_size} \
                 --ngpu "${_ngpu}" \
                 --data_path_and_name_and_type "${_data}/${_scp},speech,${_type}" \
@@ -1657,7 +1761,7 @@ if [ ${stage} -le 12 ] && [ ${stop_stage} -ge 12 ] && ! [[ " ${skip_stages} " =~
                 ${_opts} ${inference_args} || { cat $(grep -l -i error "${_logdir}"/asr_inference.*.log) ; exit 1; }
 
         # 3. Calculate and report RTF based on decoding logs
-        if [ ${asr_task} == "asr" ] && [ -z ${inference_bin_tag} ]; then
+        if [ ${disfluency_task} == "asr" ] && [ -z ${inference_bin_tag} ]; then
             log "Calculating RTF & latency... log: '${_logdir}/calculate_rtf.log'"
             rm -f "${_logdir}"/calculate_rtf.log
             _fs=$(python3 -c "import humanfriendly as h;print(h.parse_size('${fs}'))")
@@ -1673,6 +1777,7 @@ if [ ${stage} -le 12 ] && [ ${stop_stage} -ge 12 ] && ! [[ " ${skip_stages} " =~
         fi
 
         # 4. Concatenates the output files from each jobs
+        # Standard ASR outputs
         # shellcheck disable=SC2068
         for ref_txt in ${ref_text_files[@]}; do
             suffix=$(echo ${ref_txt} | sed 's/text//')
@@ -1685,12 +1790,41 @@ if [ ${stage} -le 12 ] && [ ${stop_stage} -ge 12 ] && ! [[ " ${skip_stages} " =~
             done
         done
 
+        # Disfluency-specific outputs (if available)
+        if "${use_disfluency_detection}"; then
+            log "Concatenating disfluency detection results for ${dset}"
+
+            # 1best_recog配下のdisfluency系ファイルを集約
+            for f in disfluency disfluency_labels token_disfluency_pairs; do
+                if [ -f "${_logdir}/output.1/1best_recog/${f}" ]; then
+                    for i in $(seq "${_nj}"); do
+                        cat "${_logdir}/output.${i}/1best_recog/${f}"
+                    done | sort -k1 >"${_dir}/${f}"
+                fi
+            done
+
+            # 非1best_recog配下のdisfluency系ファイルも集約
+            for f in disfluency disfluency_labels token_disfluency_pairs; do
+                if [ -f "${_logdir}/output.1/${f}" ]; then
+                    for i in $(seq "${_nj}"); do
+                        cat "${_logdir}/output.${i}/${f}"
+                    done | sort -k1 >"${_dir}/${f}"
+                fi
+            done
+
+            # ★リファレンスisdysflはコピーしない（decodeで生成しない！）
+            # ここでisdysflをcpするのは「評価用リファレンスをdecodeディレクトリに置く」だけ
+            # 予測値は必ずdisfluencyファイル
+        fi
+
     done
 fi
 
 
+# ===== Stage 13: Scoring =====
 if [ ${stage} -le 13 ] && [ ${stop_stage} -ge 13 ] && ! [[ " ${skip_stages} " =~ [[:space:]]13[[:space:]] ]]; then
     log "Stage 13: Scoring"
+    
     if [ "${token_type}" = phn ]; then
         log "Error: Not implemented for token_type=phn"
         exit 1
@@ -1701,12 +1835,18 @@ if [ ${stage} -le 13 ] && [ ${stop_stage} -ge 13 ] && ! [[ " ${skip_stages} " =~
     else
         _dsets="${test_sets}"
     fi
+    
     for dset in ${_dsets}; do
         _data="${data_feats}/${dset}"
         _dir="${asr_exp}/${inference_tag}/${dset}"
 
+        log "=== Evaluating ${dset} ==="
+
+        # ===== ASR Evaluation (Standard) =====
         for _tok_type in "char" "word" "bpe"; do
             [ "${_tok_type}" = bpe ] && [ ! -f "${bpemodel}" ] && continue
+
+            log "Evaluating ASR performance with ${_tok_type} tokens"
 
             _opts="--token_type ${_tok_type} "
             if [ "${_tok_type}" = "char" ] || [ "${_tok_type}" = "word" ]; then
@@ -1717,49 +1857,49 @@ if [ ${stage} -le 13 ] && [ ${stop_stage} -ge 13 ] && ! [[ " ${skip_stages} " =~
                 else
                     _opts+="--remove_non_linguistic_symbols true "
                 fi
-
             elif [ "${_tok_type}" = "bpe" ]; then
                 _type="ter"
                 _opts+="--bpemodel ${bpemodel} "
-
             else
                 log "Error: unsupported token type ${_tok_type}"
+                continue
             fi
 
             _scoredir="${_dir}/score_${_type}"
             mkdir -p "${_scoredir}"
 
+            # Process each reference text file
             # shellcheck disable=SC2068
             for ref_txt in ${ref_text_files[@]}; do
-                # Note(simpleoier): to get the suffix after text, e.g. "text_spk1" -> "_spk1"
+                # Note: to get the suffix after text, e.g. "text_spk1" -> "_spk1"
                 suffix=$(echo ${ref_txt} | sed 's/text//')
 
-                # Tokenize text to ${_tok_type} level
+                # Tokenize reference text to ${_tok_type} level
                 paste \
                     <(<"${_data}/${ref_txt}" \
-                        ${python} -m espnet2.bin.tokenize_text  \
+                        ${python} -m espnet2.bin.tokenize_text \
                             -f 2- --input - --output - \
                             --cleaner "${cleaner}" \
                             ${_opts} \
-                            ) \
+                    ) \
                     <(<"${_data}/utt2spk" awk '{ print "(" $2 "-" $1 ")" }') \
-                        >"${_scoredir}/ref${suffix:-${suffix}}.trn"
+                    > "${_scoredir}/ref${suffix}.trn"
 
-                # NOTE(kamo): Don't use cleaner for hyp
+                # Tokenize hypothesis text (don't use cleaner for hyp)
                 paste \
-                    <(<"${_dir}/${ref_txt}"  \
-                        ${python} -m espnet2.bin.tokenize_text  \
+                    <(<"${_dir}/${ref_txt}" \
+                        ${python} -m espnet2.bin.tokenize_text \
                             -f 2- --input - --output - \
                             ${_opts} \
                             --cleaner "${hyp_cleaner}" \
-                            ) \
+                    ) \
                     <(<"${_data}/utt2spk" awk '{ print "(" $2 "-" $1 ")" }') \
-                        >"${_scoredir}/hyp${suffix:-${suffix}}.trn"
-
+                    > "${_scoredir}/hyp${suffix}.trn"
             done
 
-            # Note(simpleoier): score across all possible permutations
+            # Multi-speaker scoring (if applicable)
             if [ ${num_ref} -gt 1 ] && [ -n "${suffix}" ]; then
+                log "Computing multi-speaker permutation scores"
                 for i in $(seq ${num_ref}); do
                     for j in $(seq ${num_inf}); do
                         sclite \
@@ -1769,27 +1909,389 @@ if [ ${stage} -le 13 ] && [ ${stop_stage} -ge 13 ] && ! [[ " ${skip_stages} " =~
                             -i rm -o all stdout > "${_scoredir}/result_r${i}h${j}.txt"
                     done
                 done
-                # Generate the oracle permutation hyp.trn and ref.trn
-                pyscripts/utils/eval_perm_free_error.py --num-spkrs ${num_ref} \
+                
+                # Generate oracle permutation
+                pyscripts/utils/eval_perm_free_error.py \
+                    --num-spkrs ${num_ref} \
                     --results-dir ${_scoredir}
             fi
 
+            # Standard single-reference scoring
             sclite \
                 ${score_opts} \
                 -r "${_scoredir}/ref.trn" trn \
                 -h "${_scoredir}/hyp.trn" trn \
                 -i rm -o all stdout > "${_scoredir}/result.txt"
 
-            log "Write ${_type} result in ${_scoredir}/result.txt"
+            log "ASR ${_type} results written to ${_scoredir}/result.txt"
             grep -e Avg -e SPKR -m 2 "${_scoredir}/result.txt"
         done
+
+        # ===== Disfluency Evaluation (if enabled) =====
+        if "${use_disfluency_detection}"; then
+            log "=== Evaluating Disfluency Detection for ${dset} ==="
+            
+            _disfluency_scoredir="${_dir}/score_disfluency"
+            mkdir -p "${_disfluency_scoredir}"
+            
+            # Check if both reference and hypothesis disfluency files exist
+            if [ -f "${_data}/isdysfl" ] && [ -f "${_dir}/disfluency" ]; then
+                log "Computing disfluency detection metrics"
+                
+                # Create comprehensive evaluation script
+                cat > "${_disfluency_scoredir}/eval_disfluency.py" << 'EOF'
+#!/usr/bin/env python3
+"""
+Comprehensive disfluency detection evaluation script.
+Computes accuracy, precision, recall, F1-score, and confusion matrix.
+"""
+
+import sys
+import argparse
+from collections import defaultdict
+
+def load_labels(file_path):
+    """Load disfluency labels from file."""
+    utts = {}
+    total_tokens = 0
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+                
+            parts = line.split()
+            if len(parts) < 2:
+                print(f"Warning: Invalid line {line_num} in {file_path}: {line}", file=sys.stderr)
+                continue
+                
+            utt_id = parts[0]
+            try:
+                labels = [int(x) for x in parts[1:]]
+                utts[utt_id] = labels
+                total_tokens += len(labels)
+            except ValueError as e:
+                print(f"Warning: Invalid labels in line {line_num}: {e}", file=sys.stderr)
+                continue
+    
+    print(f"Loaded {len(utts)} utterances with {total_tokens} tokens from {file_path}")
+    return utts
+
+def compute_metrics(ref_labels, hyp_labels, num_classes=4):
+    """Compute detailed classification metrics."""
+    # Convert to common length
+    min_len = min(len(ref_labels), len(hyp_labels))
+    if min_len == 0:
+        return {}
+    
+    ref_labels = ref_labels[:min_len]
+    hyp_labels = hyp_labels[:min_len]
+    
+    # Overall accuracy
+    correct = sum(1 for r, h in zip(ref_labels, hyp_labels) if r == h)
+    accuracy = correct / len(ref_labels)
+    
+    # Per-class metrics
+    class_metrics = {}
+    confusion_matrix = [[0] * num_classes for _ in range(num_classes)]
+    
+    # Build confusion matrix
+    for r, h in zip(ref_labels, hyp_labels):
+        if 0 <= r < num_classes and 0 <= h < num_classes:
+            confusion_matrix[r][h] += 1
+    
+    # Compute per-class precision, recall, F1
+    for cls in range(num_classes):
+        # True positives, false positives, false negatives
+        tp = confusion_matrix[cls][cls]
+        fp = sum(confusion_matrix[i][cls] for i in range(num_classes)) - tp
+        fn = sum(confusion_matrix[cls][i] for i in range(num_classes)) - tp
+        
+        # Precision, Recall, F1
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        
+        class_metrics[cls] = {
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'support': tp + fn,
+            'tp': tp,
+            'fp': fp,
+            'fn': fn
+        }
+    
+    return {
+        'accuracy': accuracy,
+        'class_metrics': class_metrics,
+        'confusion_matrix': confusion_matrix,
+        'total_samples': len(ref_labels)
+    }
+
+def evaluate_disfluency(ref_file, hyp_file, output_file):
+    """Main evaluation function."""
+    print(f"Evaluating disfluency detection:")
+    print(f"  Reference: {ref_file}")
+    print(f"  Hypothesis: {hyp_file}")
+    print(f"  Output: {output_file}")
+    
+    # Load data
+    ref_data = load_labels(ref_file)
+    hyp_data = load_labels(hyp_file)
+    
+    if len(ref_data) == 0:
+        print("Error: No reference data found!")
+        return
+    
+    if len(hyp_data) == 0:
+        print("Error: No hypothesis data found!")
+        return
+    
+    # Collect labels for evaluation
+    all_ref_labels = []
+    all_hyp_labels = []
+    utt_metrics = {}
+    
+    matched_utts = 0
+    for utt_id in ref_data:
+        if utt_id in hyp_data:
+            ref_seq = ref_data[utt_id]
+            hyp_seq = hyp_data[utt_id]
+            
+            # Compute per-utterance metrics
+            utt_metrics[utt_id] = compute_metrics(ref_seq, hyp_seq)
+            
+            # Add to global lists
+            min_len = min(len(ref_seq), len(hyp_seq))
+            all_ref_labels.extend(ref_seq[:min_len])
+            all_hyp_labels.extend(hyp_seq[:min_len])
+            matched_utts += 1
+    
+    if len(all_ref_labels) == 0:
+        print("Error: No matching utterances found!")
+        return
+    
+    print(f"Matched {matched_utts}/{len(ref_data)} utterances")
+    
+    # Compute overall metrics
+    overall_metrics = compute_metrics(all_ref_labels, all_hyp_labels)
+    
+    # Class names
+    class_names = ['Fluent', 'Filler', 'Repetition', 'Interjection']
+    
+    # Write results
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("=" * 50 + "\n")
+        f.write("Disfluency Detection Evaluation Results\n")
+        f.write("=" * 50 + "\n\n")
+        
+        # Overall statistics
+        f.write(f"Dataset Statistics:\n")
+        f.write(f"  Total utterances (ref): {len(ref_data)}\n")
+        f.write(f"  Total utterances (hyp): {len(hyp_data)}\n")
+        f.write(f"  Matched utterances: {matched_utts}\n")
+        f.write(f"  Total tokens evaluated: {overall_metrics['total_samples']}\n\n")
+        
+        # Overall accuracy
+        f.write(f"Overall Accuracy: {overall_metrics['accuracy']:.4f}\n\n")
+        
+        # Per-class detailed results
+        f.write("Per-Class Results:\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"{'Class':<12} {'Precision':<10} {'Recall':<10} {'F1-Score':<10} {'Support':<10}\n")
+        f.write("-" * 70 + "\n")
+        
+        macro_f1 = 0
+        weighted_f1 = 0
+        total_support = 0
+        
+        for cls in range(4):
+            if cls in overall_metrics['class_metrics']:
+                metrics = overall_metrics['class_metrics'][cls]
+                class_name = class_names[cls] if cls < len(class_names) else f"Class{cls}"
+                
+                f.write(f"{class_name:<12} {metrics['precision']:<10.4f} {metrics['recall']:<10.4f} "
+                       f"{metrics['f1']:<10.4f} {metrics['support']:<10}\n")
+                
+                macro_f1 += metrics['f1']
+                weighted_f1 += metrics['f1'] * metrics['support']
+                total_support += metrics['support']
+        
+        macro_f1 /= 4
+        weighted_f1 /= total_support if total_support > 0 else 1
+        
+        f.write("-" * 70 + "\n")
+        f.write(f"{'Macro avg':<12} {'':<10} {'':<10} {macro_f1:<10.4f} {total_support:<10}\n")
+        f.write(f"{'Weighted avg':<12} {'':<10} {'':<10} {weighted_f1:<10.4f} {total_support:<10}\n")
+        f.write("\n")
+        
+        # Confusion Matrix
+        f.write("Confusion Matrix:\n")
+        f.write("-" * 50 + "\n")
+        f.write("Predicted ->   ")
+        for i, name in enumerate(class_names):
+            f.write(f"{i}({name[:3]})  ")
+        f.write("\n")
+        f.write("Actual ↓\n")
+        
+        cm = overall_metrics['confusion_matrix']
+        for i, name in enumerate(class_names):
+            f.write(f"{i}({name[:8]:<8})  ")
+            for j in range(4):
+                f.write(f"{cm[i][j]:<8} ")
+            f.write("\n")
+        f.write("\n")
+        
+        # Label distribution
+        f.write("Label Distribution:\n")
+        f.write("-" * 30 + "\n")
+        ref_counts = [0] * 4
+        hyp_counts = [0] * 4
+        
+        for label in all_ref_labels:
+            if 0 <= label < 4:
+                ref_counts[label] += 1
+        
+        for label in all_hyp_labels:
+            if 0 <= label < 4:
+                hyp_counts[label] += 1
+        
+        for i, name in enumerate(class_names):
+            f.write(f"{name}: Ref={ref_counts[i]} ({ref_counts[i]/len(all_ref_labels)*100:.1f}%), "
+                   f"Hyp={hyp_counts[i]} ({hyp_counts[i]/len(all_hyp_labels)*100:.1f}%)\n")
+    
+    # Print summary to console
+    print(f"\nEvaluation completed successfully!")
+    print(f"Overall Accuracy: {overall_metrics['accuracy']:.4f}")
+    print(f"Macro F1-Score: {macro_f1:.4f}")
+    print(f"Results saved to: {output_file}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Evaluate disfluency detection performance")
+    parser.add_argument("--ref", required=True, help="Reference disfluency file")
+    parser.add_argument("--hyp", required=True, help="Hypothesis disfluency file")
+    parser.add_argument("--output", required=True, help="Output evaluation file")
+    
+    args = parser.parse_args()
+    evaluate_disfluency(args.ref, args.hyp, args.output)
+EOF
+
+                # Make the script executable and run evaluation
+                chmod +x "${_disfluency_scoredir}/eval_disfluency.py"
+                
+                log "Running disfluency evaluation..."
+                ${python} "${_disfluency_scoredir}/eval_disfluency.py" \
+                    --ref "${_data}/isdysfl" \
+                    --hyp "${_dir}/disfluency" \
+                    --output "${_disfluency_scoredir}/disfluency_result.txt" || {
+                    log "Warning: Disfluency evaluation failed"
+                }
+                
+                # Display key results
+                if [ -f "${_disfluency_scoredir}/disfluency_result.txt" ]; then
+                    log "Disfluency detection results for ${dset}:"
+                    echo "----------------------------------------"
+                    head -20 "${_disfluency_scoredir}/disfluency_result.txt" | grep -E "(Overall Accuracy|Per-Class Results|Fluent|Filler|Repetition|Interjection)"
+                    echo "----------------------------------------"
+                fi
+                
+            else
+                log "Warning: Cannot evaluate disfluency detection for ${dset}"
+                if [ ! -f "${_data}/isdysfl" ]; then
+                    log "  Missing reference file: ${_data}/isdysfl"
+                fi
+                if [ ! -f "${_dir}/disfluency" ]; then
+                    log "  Missing hypothesis file: ${_dir}/disfluency"
+                fi
+            fi
+            
+            # Generate disfluency statistics (always show if hypothesis exists)
+            if [ -f "${_dir}/disfluency" ]; then
+                log "Disfluency label distribution in ${dset}:"
+                total_tokens=$(cut -d' ' -f2- "${_dir}/disfluency" | tr ' ' '\n' | grep -E '^[0-3]$' | wc -l)
+                
+                if [ "$total_tokens" -gt 0 ]; then
+                    cut -d' ' -f2- "${_dir}/disfluency" | tr ' ' '\n' | grep -E '^[0-3]$' | sort | uniq -c | \
+                        awk -v total="$total_tokens" '{
+                            if ($2=="0") printf "  Fluent (0):      %6d (%5.1f%%)\n", $1, $1/total*100
+                            else if ($2=="1") printf "  Filler (1):      %6d (%5.1f%%)\n", $1, $1/total*100
+                            else if ($2=="2") printf "  Repetition (2):  %6d (%5.1f%%)\n", $1, $1/total*100
+                            else if ($2=="3") printf "  Interjection (3):%6d (%5.1f%%)\n", $1, $1/total*100
+                        }'
+                    echo "  Total tokens: $total_tokens"
+                else
+                    log "  No valid disfluency labels found"
+                fi
+            fi
+            
+            echo ""  # Add spacing
+        fi
     done
 
-    [ -f local/score.sh ] && local/score.sh ${local_score_opts} "${asr_exp}"
+    # Run local scoring script if available
+    if [ -f local/score.sh ]; then
+        log "Running local scoring script..."
+        local/score.sh ${local_score_opts} "${asr_exp}"
+    fi
 
-    # Show results in Markdown syntax
+    # Generate comprehensive results in Markdown format
+    log "Generating results summary..."
     scripts/utils/show_asr_result.sh "${asr_exp}" > "${asr_exp}"/RESULTS.md
+    
+    # Add disfluency results to markdown (if available)
+    if "${use_disfluency_detection}"; then
+        {
+            echo ""
+            echo "## Disfluency Detection Results"
+            echo ""
+            
+            for dset in ${_dsets}; do
+                _disfluency_scoredir="${asr_exp}/${inference_tag}/${dset}/score_disfluency"
+                
+                if [ -f "${_disfluency_scoredir}/disfluency_result.txt" ]; then
+                    echo "### Dataset: ${dset}"
+                    echo ""
+                    echo '```'
+                    # Extract key metrics
+                    grep -E "(Overall Accuracy|Fluent|Filler|Repetition|Interjection)" \
+                        "${_disfluency_scoredir}/disfluency_result.txt" | head -10
+                    echo '```'
+                    echo ""
+                fi
+            done
+            
+            echo "### Disfluency Detection Summary"
+            echo ""
+            echo "| Dataset | Accuracy | Notes |"
+            echo "|---------|----------|-------|"
+            
+            for dset in ${_dsets}; do
+                _disfluency_scoredir="${asr_exp}/${inference_tag}/${dset}/score_disfluency"
+                
+                if [ -f "${_disfluency_scoredir}/disfluency_result.txt" ]; then
+                    accuracy=$(grep "Overall Accuracy:" "${_disfluency_scoredir}/disfluency_result.txt" | awk '{print $3}')
+                    echo "| ${dset} | ${accuracy:-N/A} | Detailed results available |"
+                else
+                    echo "| ${dset} | N/A | Evaluation failed or files missing |"
+                fi
+            done
+            echo ""
+            
+        } >> "${asr_exp}"/RESULTS.md
+    fi
+    
+    # Display final results
+    log "=== Final Results Summary ==="
     cat "${asr_exp}"/RESULTS.md
+    
+    log "Stage 13 (Scoring) completed successfully!"
+    log "Results saved to: ${asr_exp}/RESULTS.md"
+    
+    if "${use_disfluency_detection}"; then
+        log "Disfluency detection results available in: ${asr_exp}/${inference_tag}/*/score_disfluency/"
+    fi
 
 fi
 
