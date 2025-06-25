@@ -537,15 +537,37 @@ class CommonPreprocessor(AbsPreprocessor):
                     tokens = self.tokenizer.text2tokens(text)
                     text_ints = self.token_id_converter.tokens2ids(tokens)
                     data[name] = np.array(text_ints, dtype=np.int64)
+        
+        if "isdysfl" in data and self.text_name in data:
+            # text: np.ndarray（token id列）になっているはず
+            text_len = len(data[self.text_name])
+            # isdysfl: strまたはnp.ndarray
+            if isinstance(data["isdysfl"], str):
+                isdysfl = [int(x) for x in data["isdysfl"].split()]
+            else:
+                isdysfl = list(data["isdysfl"])
+            # 長さを揃える（短い場合は0でパディング、長い場合はカット）
+            if len(isdysfl) < text_len:
+                isdysfl += [0] * (text_len - len(isdysfl))
+            elif len(isdysfl) > text_len:
+                isdysfl = isdysfl[:text_len]
+            data["isdysfl"] = np.array(isdysfl, dtype=np.int64)
+            
         return data
 
     @typechecked
     def __call__(
         self, uid: str, data: Dict[str, Union[str, np.ndarray]]
     ) -> Dict[str, np.ndarray]:
-
         data = self._speech_process(data)
         data = self._text_process(data)
+        # isdysflをnp.ndarrayに変換
+        if "isdysfl" in data:
+            if not isinstance(data["isdysfl"], np.ndarray):
+                if isinstance(data["isdysfl"], str):
+                    data["isdysfl"] = np.array([int(x) for x in data["isdysfl"].split()], dtype=np.int64)
+                else:
+                    data["isdysfl"] = np.array(data["isdysfl"], dtype=np.int64)
         return data
 
 

@@ -140,6 +140,8 @@ class BatchBeamSearch(BeamSearch):
         init_states = dict()
         init_scores = dict()
         for k, d in self.scorers.items():
+            if d is None:
+                continue
             init_states[k] = d.batch_init_state(x)
             init_scores[k] = 0.0
 
@@ -185,13 +187,23 @@ class BatchBeamSearch(BeamSearch):
         states = dict()
         for k, d in self.full_scorers.items():
             if "decoder" in k and self.return_hs:
-                (scores[k], hs), states[k] = d.batch_score(
+                (score, hs), states[k] = d.batch_score(
                     hyp.yseq, hyp.states[k], x, return_hs=self.return_hs
                 )
+                # scoreがタプルの場合は最初の要素だけ使う
+                if isinstance(score, tuple):
+                    score = score[0]
+                scores[k] = score
             elif "decoder" in k and pre_x is not None:
-                scores[k], states[k] = d.batch_score(hyp.yseq, hyp.states[k], x, pre_x)
+                score, states[k] = d.batch_score(hyp.yseq, hyp.states[k], x, pre_x)
+                if isinstance(score, tuple):
+                    score = score[0]
+                scores[k] = score
             else:
-                scores[k], states[k] = d.batch_score(hyp.yseq, hyp.states[k], x)
+                score, states[k] = d.batch_score(hyp.yseq, hyp.states[k], x)
+                if isinstance(score, tuple):
+                    score = score[0]
+                scores[k] = score
 
         if self.return_hs:
             return hs, scores, states
@@ -226,13 +238,17 @@ class BatchBeamSearch(BeamSearch):
         states = dict()
         for k, d in self.part_scorers.items():
             if "ctc" in k and pre_x is not None:
-                scores[k], states[k] = d.batch_score_partial(
+                score, states[k] = d.batch_score_partial(
                     hyp.yseq, ids, hyp.states[k], pre_x
                 )
             else:
-                scores[k], states[k] = d.batch_score_partial(
+                score, states[k] = d.batch_score_partial(
                     hyp.yseq, ids, hyp.states[k], x
                 )
+            # ここでscoreがタプルなら0番目だけ使う
+            if isinstance(score, tuple):
+                score = score[0]
+            scores[k] = score
         return scores, states
 
     def merge_states(self, states: Any, part_states: Any, part_idx: int) -> Any:
@@ -297,7 +313,17 @@ class BatchBeamSearch(BeamSearch):
             )
 
         for k in self.full_scorers:
-            weighted_scores += self.weights[k] * scores[k]
+            if k not in self.weights or k not in scores:
+                continue
+            # 型チェックを追加
+            if isinstance(scores[k], (float, int)) or (
+                hasattr(scores[k], "dtype") and "float" in str(scores[k].dtype)
+            ):
+                weighted_scores += self.weights[k] * scores[k]
+            else:
+                # デバッグ用: 型と値を出力
+                print(f"[WARN] scores[{k}] has unexpected type: {type(scores[k])}, value: {scores[k]}")
+                continue
         # partial scoring
         if self.do_pre_beam:
             pre_beam_scores = (
@@ -311,6 +337,8 @@ class BatchBeamSearch(BeamSearch):
         # for others.
         part_scores, part_states = self.score_partial(running_hyps, part_ids, x, pre_x)
         for k in self.part_scorers:
+            if k not in self.weights or k not in part_scores:
+                continue
             weighted_scores += self.weights[k] * part_scores[k]
         # add previous hyp scores
         weighted_scores += running_hyps.score.to(

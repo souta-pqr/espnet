@@ -1,6 +1,6 @@
 import argparse
 import logging
-from typing import Callable, Collection, Dict, List, Optional, Tuple
+from typing import Callable, Collection, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -91,6 +91,10 @@ from espnet2.utils.get_default_kwargs import get_default_kwargs
 from espnet2.utils.nested_dict_action import NestedDictAction
 from espnet2.utils.types import float_or_none, int_or_none, str2bool, str_or_none
 
+# Import statements (add these to the existing imports)
+from espnet2.asr.decoder.transformer_decoder import DisfluencyTransformerDecoder
+from espnet2.asr.espnet_model import DisfluencyESPnetASRModel
+
 frontend_choices = ClassChoices(
     name="frontend",
     classes=dict(
@@ -129,6 +133,8 @@ model_choices = ClassChoices(
         espnet=ESPnetASRModel,
         maskctc=MaskCTCModel,
         pit_espnet=PITESPnetModel,
+        # New: Disfluency model
+        disfluency_espnet=DisfluencyESPnetASRModel,
     ),
     type_check=AbsESPnetModel,
     default="espnet",
@@ -193,6 +199,8 @@ decoder_choices = ClassChoices(
         hugging_face_transformers=HuggingFaceTransformersDecoder,
         s4=S4Decoder,
         linear_decoder=LinearDecoder,
+        # New: Disfluency decoder
+        disfluency_transformer=DisfluencyTransformerDecoder,
         # This decoder is only meant for classification tasks.
         # TODO(shikhar): Move classification to cls1 task completely.
     ),
@@ -635,6 +643,347 @@ class ASRTask(AbsTask):
             token_list=token_list,
             **args.model_conf,
         )
+
+        # FIXME(kamo): Should be done in model?
+        # 8. Initialize
+        if args.init is not None:
+            initialize(model, args.init)
+
+        return model
+
+class DisfluencyASRTask(ASRTask):
+    """ASR Task with disfluency detection capability"""
+    
+    # If you need more than one optimizers, change this value
+    num_optimizers: int = 1
+
+    # Add variable objects configurations (extend from parent)
+    class_choices_list = [
+        # --frontend and --frontend_conf
+        frontend_choices,
+        # --specaug and --specaug_conf
+        specaug_choices,
+        # --normalize and --normalize_conf
+        normalize_choices,
+        # --model and --model_conf
+        model_choices,
+        # --preencoder and --preencoder_conf
+        preencoder_choices,
+        # --encoder and --encoder_conf
+        encoder_choices,
+        # --postencoder and --postencoder_conf
+        postencoder_choices,
+        # --decoder and --decoder_conf
+        decoder_choices,
+        # --preprocessor and --preprocessor_conf
+        preprocessor_choices,
+    ]
+
+    # If you need to modify train() or eval() procedures, change Trainer class here
+    trainer = Trainer
+
+    @classmethod
+    def add_task_arguments(cls, parser: argparse.ArgumentParser):
+        # Call parent class method first
+        super().add_task_arguments(parser)
+        
+        # Add disfluency-specific arguments
+        group = parser.add_argument_group(description="Disfluency detection related")
+        
+        group.add_argument(
+            "--disfluency_weight",
+            type=float,
+            default=1.0,
+            help="Weight for disfluency detection loss",
+        )
+        group.add_argument(
+            "--disfluency_classes",
+            type=int,
+            default=4,
+            help="Number of disfluency classes (default: 4 - fluent, filler, repetition, interjection)",
+        )
+        group.add_argument(
+            "--report_disfluency_accuracy",
+            type=str2bool,
+            default=True,
+            help="Report disfluency detection accuracy",
+        )
+        group.add_argument(
+            "--use_disfluency_detection",
+            type=str2bool,
+            default=True,
+            help="Whether to use disfluency detection",
+        )
+
+    @classmethod
+    def required_data_names(
+        cls, train: bool = True, inference: bool = False
+    ) -> Tuple[str, ...]:
+        if not inference:
+            retval = ("speech", "text")
+        else:
+            # Recognition mode
+            retval = ("speech",)
+        return retval
+
+    @classmethod
+    def optional_data_names(
+        cls, train: bool = True, inference: bool = False
+    ) -> Tuple[str, ...]:
+        MAX_REFERENCE_NUM = 4
+
+        retval = ["text_spk{}".format(n) for n in range(2, MAX_REFERENCE_NUM + 1)]
+        retval = retval + ["prompt"]
+        # Add disfluency labels as optional data
+        retval = retval + ["isdysfl"]
+        retval = tuple(retval)
+
+        logging.info(f"Optional Data Names: {retval}")
+        return retval
+
+    @classmethod
+    @typechecked
+    def build_collate_fn(cls, args: argparse.Namespace, train: bool) -> Callable[
+        [Collection[Tuple[str, Dict[str, np.ndarray]]]],
+        Tuple[List[str], Dict[str, torch.Tensor]],
+    ]:
+        # NOTE(kamo): int value = 0 is reserved by CTC-blank symbol
+        return CommonCollateFn(float_pad_value=0.0, int_pad_value=-1)
+
+    @classmethod
+    @typechecked
+    def build_preprocess_fn(
+        cls, args: argparse.Namespace, train: bool
+    ) -> Optional[Callable[[str, Dict[str, np.array]], Dict[str, np.ndarray]]]:
+        if args.use_preprocessor:
+            try:
+                _ = getattr(args, "preprocessor")
+            except AttributeError:
+                setattr(args, "preprocessor", "default")
+                setattr(args, "preprocessor_conf", dict())
+            except Exception as e:
+                raise e
+
+            preprocessor_class = preprocessor_choices.get_class(args.preprocessor)
+            retval = preprocessor_class(
+                train=train,
+                token_type=args.token_type,
+                token_list=args.token_list,
+                bpemodel=args.bpemodel,
+                non_linguistic_symbols=args.non_linguistic_symbols,
+                text_cleaner=args.cleaner,
+                g2p_type=args.g2p,
+                # NOTE(kamo): Check attribute existence for backward compatibility
+                rir_scp=args.rir_scp if hasattr(args, "rir_scp") else None,
+                rir_apply_prob=(
+                    args.rir_apply_prob if hasattr(args, "rir_apply_prob") else 1.0
+                ),
+                noise_scp=args.noise_scp if hasattr(args, "noise_scp") else None,
+                noise_apply_prob=(
+                    args.noise_apply_prob if hasattr(args, "noise_apply_prob") else 1.0
+                ),
+                noise_db_range=(
+                    args.noise_db_range if hasattr(args, "noise_db_range") else "13_15"
+                ),
+                short_noise_thres=(
+                    args.short_noise_thres
+                    if hasattr(args, "short_noise_thres")
+                    else 0.5
+                ),
+                speech_volume_normalize=(
+                    args.speech_volume_normalize if hasattr(args, "rir_scp") else None
+                ),
+                aux_task_names=(
+                    args.aux_ctc_tasks if hasattr(args, "aux_ctc_tasks") else None
+                ),
+                use_lang_prompt=(
+                    args.use_lang_prompt if hasattr(args, "use_lang_prompt") else None
+                ),
+                **args.preprocessor_conf,
+                use_nlp_prompt=(
+                    args.use_nlp_prompt if hasattr(args, "use_nlp_prompt") else None
+                ),
+            )
+        else:
+            retval = None
+        return retval
+
+    @classmethod
+    @typechecked
+    def build_model(cls, args: argparse.Namespace) -> Union[ESPnetASRModel, DisfluencyESPnetASRModel]:
+        if isinstance(args.token_list, str):
+            with open(args.token_list, encoding="utf-8") as f:
+                token_list = [line.rstrip() for line in f]
+
+            # Overwriting token_list to keep it as "portable".
+            args.token_list = list(token_list)
+        elif isinstance(args.token_list, (tuple, list)):
+            token_list = list(args.token_list)
+        else:
+            raise RuntimeError("token_list must be str or list")
+
+        # If use multi-blank transducer criterion,
+        # big blank symbols are added just before the standard blank
+        if args.model_conf.get("transducer_multi_blank_durations", None) is not None:
+            sym_blank = args.model_conf.get("sym_blank", "<blank>")
+            blank_idx = token_list.index(sym_blank)
+            for dur in args.model_conf.get("transducer_multi_blank_durations"):
+                if f"<blank{dur}>" not in token_list:  # avoid this during inference
+                    token_list.insert(blank_idx, f"<blank{dur}>")
+            args.token_list = token_list
+
+        vocab_size = len(token_list)
+        logging.info(f"Vocabulary size: {vocab_size}")
+
+        # 1. frontend
+        if args.input_size is None:
+            # Extract features in the model
+            frontend_class = frontend_choices.get_class(args.frontend)
+            frontend = frontend_class(**args.frontend_conf)
+            input_size = frontend.output_size()
+        else:
+            # Give features from data-loader
+            args.frontend = None
+            args.frontend_conf = {}
+            frontend = None
+            input_size = args.input_size
+
+        # 2. Data augmentation for spectrogram
+        if args.specaug is not None:
+            specaug_class = specaug_choices.get_class(args.specaug)
+            specaug = specaug_class(**args.specaug_conf)
+        else:
+            specaug = None
+
+        # 3. Normalization layer
+        if args.normalize is not None:
+            normalize_class = normalize_choices.get_class(args.normalize)
+            normalize = normalize_class(**args.normalize_conf)
+        else:
+            normalize = None
+
+        # 4. Pre-encoder input block
+        # NOTE(kan-bayashi): Use getattr to keep the compatibility
+        if getattr(args, "preencoder", None) is not None:
+            preencoder_class = preencoder_choices.get_class(args.preencoder)
+            preencoder = preencoder_class(**args.preencoder_conf)
+            input_size = preencoder.output_size()
+        else:
+            preencoder = None
+
+        # 4. Encoder
+        encoder_class = encoder_choices.get_class(args.encoder)
+        encoder = encoder_class(input_size=input_size, **args.encoder_conf)
+
+        # 5. Post-encoder block
+        # NOTE(kan-bayashi): Use getattr to keep the compatibility
+        encoder_output_size = encoder.output_size()
+        if getattr(args, "postencoder", None) is not None:
+            postencoder_class = postencoder_choices.get_class(args.postencoder)
+            postencoder = postencoder_class(
+                input_size=encoder_output_size, **args.postencoder_conf
+            )
+            encoder_output_size = postencoder.output_size()
+        else:
+            postencoder = None
+
+        # 5. Decoder
+        if getattr(args, "decoder", None) is not None:
+            decoder_class = decoder_choices.get_class(args.decoder)
+
+            if args.decoder == "transducer":
+                decoder = decoder_class(
+                    vocab_size,
+                    embed_pad=0,
+                    **args.decoder_conf,
+                )
+
+                joint_network = JointNetwork(
+                    vocab_size,
+                    encoder.output_size(),
+                    decoder.dunits,
+                    **args.joint_net_conf,
+                )
+            elif args.decoder == "disfluency_transformer":
+                # Add disfluency-specific parameters
+                disfluency_classes = getattr(args, "disfluency_classes", 4)
+                disfluency_weight = getattr(args, "disfluency_weight", 1.0)
+                
+                decoder_conf = args.decoder_conf.copy()
+                decoder_conf["disfluency_classes"] = disfluency_classes
+                decoder_conf["disfluency_weight"] = disfluency_weight
+                
+                decoder = decoder_class(
+                    vocab_size=vocab_size,
+                    encoder_output_size=encoder_output_size,
+                    **decoder_conf,
+                )
+                joint_network = None
+            else:
+                decoder = decoder_class(
+                    vocab_size=vocab_size,
+                    encoder_output_size=encoder_output_size,
+                    **args.decoder_conf,
+                )
+                joint_network = None
+        else:
+            decoder = None
+            joint_network = None
+
+        # 6. CTC
+        ctc = CTC(
+            odim=vocab_size, encoder_output_size=encoder_output_size, **args.ctc_conf
+        )
+
+        # 7. Build model
+        try:
+            if args.model == "disfluency_espnet" or args.decoder == "disfluency_transformer":
+                model_class = model_choices.get_class("disfluency_espnet")
+            else:
+                model_class = model_choices.get_class(args.model)
+        except AttributeError:
+            model_class = model_choices.get_class("espnet")
+            
+        # Check if using disfluency model
+        if args.model == "disfluency_espnet" or args.decoder == "disfluency_transformer":
+            model_conf = args.model_conf.copy()
+            model_conf["disfluency_weight"] = getattr(args, "disfluency_weight", 1.0)
+            model_conf["disfluency_classes"] = getattr(args, "disfluency_classes", 4)
+            model_conf["report_disfluency_accuracy"] = getattr(args, "report_disfluency_accuracy", True)
+            model_conf["use_disfluency_detection"] = getattr(args, "use_disfluency_detection", True)
+            model = model_class(
+                vocab_size=vocab_size,
+                frontend=frontend,
+                specaug=specaug,
+                normalize=normalize,
+                preencoder=preencoder,
+                encoder=encoder,
+                postencoder=postencoder,
+                decoder=decoder,
+                ctc=ctc,
+                joint_network=joint_network,
+                token_list=token_list,
+                **model_conf,
+            )
+        else:
+            # disfluency関連引数を除外して渡す
+            model_conf = args.model_conf.copy()
+            for k in ["disfluency_weight", "disfluency_classes", "report_disfluency_accuracy", "use_disfluency_detection"]:
+                model_conf.pop(k, None)
+            model = model_class(
+                vocab_size=vocab_size,
+                frontend=frontend,
+                specaug=specaug,
+                normalize=normalize,
+                preencoder=preencoder,
+                encoder=encoder,
+                postencoder=postencoder,
+                decoder=decoder,
+                ctc=ctc,
+                joint_network=joint_network,
+                token_list=token_list,
+                **args.model_conf,
+            )
 
         # FIXME(kamo): Should be done in model?
         # 8. Initialize

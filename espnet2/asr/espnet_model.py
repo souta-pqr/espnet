@@ -713,3 +713,494 @@ class ESPnetASRModel(AbsESPnetModel):
         loss_classif = self.criterion_classif(logits, labels.squeeze(-1))
         acc_classif = th_accuracy(logits, labels, ignore_label=self.ignore_id)
         return loss_classif, acc_classif
+
+
+class DisfluencyESPnetASRModel(ESPnetASRModel):
+    """CTC-attention hybrid Encoder-Decoder model with disfluency detection"""
+
+    @typechecked
+    def __init__(
+        self,
+        vocab_size: int,
+        token_list: Union[Tuple[str, ...], List[str]],
+        frontend: Optional[AbsFrontend],
+        specaug: Optional[AbsSpecAug],
+        normalize: Optional[AbsNormalize],
+        preencoder: Optional[AbsPreEncoder],
+        encoder: AbsEncoder,
+        postencoder: Optional[AbsPostEncoder],
+        decoder: Optional[AbsDecoder],
+        ctc: CTC,
+        joint_network: Optional[torch.nn.Module],
+        aux_ctc: Optional[dict] = None,
+        ctc_weight: float = 0.5,
+        interctc_weight: float = 0.0,
+        ignore_id: int = -1,
+        lsm_weight: float = 0.0,
+        length_normalized_loss: bool = False,
+        report_cer: bool = True,
+        report_wer: bool = True,
+        sym_space: str = "<space>",
+        sym_blank: str = "<blank>",
+        transducer_multi_blank_durations: List = [],
+        transducer_multi_blank_sigma: float = 0.05,
+        sym_sos: str = "<sos/eos>",
+        sym_eos: str = "<sos/eos>",
+        extract_feats_in_collect_stats: bool = True,
+        lang_token_id: int = -1,
+        # Additional parameters for disfluency detection
+        disfluency_weight: float = 1.0,
+        disfluency_classes: int = 4,
+        report_disfluency_accuracy: bool = True,
+        use_disfluency_detection: bool = True,
+    ):
+        # Initialize parent class
+        super().__init__(
+            vocab_size=vocab_size,
+            token_list=token_list,
+            frontend=frontend,
+            specaug=specaug,
+            normalize=normalize,
+            preencoder=preencoder,
+            encoder=encoder,
+            postencoder=postencoder,
+            decoder=decoder,
+            ctc=ctc,
+            joint_network=joint_network,
+            aux_ctc=aux_ctc,
+            ctc_weight=ctc_weight,
+            interctc_weight=interctc_weight,
+            ignore_id=ignore_id,
+            lsm_weight=lsm_weight,
+            length_normalized_loss=length_normalized_loss,
+            report_cer=report_cer,
+            report_wer=report_wer,
+            sym_space=sym_space,
+            sym_blank=sym_blank,
+            transducer_multi_blank_durations=transducer_multi_blank_durations,
+            transducer_multi_blank_sigma=transducer_multi_blank_sigma,
+            sym_sos=sym_sos,
+            sym_eos=sym_eos,
+            extract_feats_in_collect_stats=extract_feats_in_collect_stats,
+            lang_token_id=lang_token_id,
+        )
+        
+        # Disfluency detection parameters
+        self.disfluency_weight = disfluency_weight
+        self.disfluency_classes = disfluency_classes
+        self.report_disfluency_accuracy = report_disfluency_accuracy
+        self.use_disfluency_detection = use_disfluency_detection
+        
+        # Check if decoder supports disfluency detection
+        self.use_disfluency_decoder = hasattr(decoder, 'disfluency_output_layer')
+        
+        # Disfluency loss criterion
+        if self.use_disfluency_decoder:
+            self.criterion_disfluency = torch.nn.CrossEntropyLoss(
+                ignore_index=ignore_id
+            )
+
+    def forward(
+        self,
+        speech: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        text: torch.Tensor,
+        text_lengths: torch.Tensor,
+        isdysfl: torch.Tensor = None,
+        isdysfl_lengths: torch.Tensor = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
+        """Frontend + Encoder + Decoder + Calc loss with disfluency detection
+
+        Args:
+            speech: (Batch, Length, ...)
+            speech_lengths: (Batch, )
+            text: (Batch, Length)
+            text_lengths: (Batch,)
+            isdysfl: (Batch, Length) - disfluency labels
+            isdysfl_lengths: (Batch,) - disfluency sequence lengths
+            kwargs: "utt_id" is among the input.
+        """
+        assert text_lengths.dim() == 1, text_lengths.shape
+        # Check that batch_size is unified
+        assert (
+            speech.shape[0]
+            == speech_lengths.shape[0]
+            == text.shape[0]
+            == text_lengths.shape[0]
+        ), (speech.shape, speech_lengths.shape, text.shape, text_lengths.shape)
+        
+        # Check disfluency labels if provided
+        if isdysfl is not None:
+            assert isdysfl.shape[0] == speech.shape[0], (isdysfl.shape, speech.shape)
+            if isdysfl_lengths is not None:
+                assert isdysfl_lengths.shape[0] == speech.shape[0], (isdysfl_lengths.shape, speech.shape)
+        
+        batch_size = speech.shape[0]
+
+        text[text == -1] = self.ignore_id
+        if isdysfl is not None:
+            isdysfl[isdysfl == -1] = self.ignore_id
+
+        # for data-parallel
+        text = text[:, : text_lengths.max()]
+        if isdysfl is not None:
+            isdysfl = isdysfl[:, : text_lengths.max()]  # Use same length as text
+
+        # 1. Encoder
+        encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
+        intermediate_outs = None
+        if isinstance(encoder_out, tuple):
+            intermediate_outs = encoder_out[1]
+            encoder_out = encoder_out[0]
+
+        loss_att, acc_att, cer_att, wer_att = None, None, None, None
+        loss_ctc, cer_ctc = None, None
+        loss_transducer, cer_transducer, wer_transducer = None, None, None
+        loss_classif, acc_classif = None, None
+        loss_disfluency, acc_disfluency = None, None  # New: disfluency loss and accuracy
+        stats = dict()
+
+        # 1. CTC branch
+        if self.ctc_weight != 0.0:
+            loss_ctc, cer_ctc = self._calc_ctc_loss(
+                encoder_out, encoder_out_lens, text, text_lengths
+            )
+
+            # Collect CTC branch stats
+            stats["loss_ctc"] = loss_ctc.detach() if loss_ctc is not None else None
+            stats["cer_ctc"] = cer_ctc
+
+        # Intermediate CTC (optional)
+        loss_interctc = 0.0
+        if self.interctc_weight != 0.0 and intermediate_outs is not None:
+            for layer_idx, intermediate_out in intermediate_outs:
+                loss_ic = None
+                if self.aux_ctc is not None:
+                    idx_key = str(layer_idx)
+                    if idx_key in self.aux_ctc:
+                        aux_data_key = self.aux_ctc[idx_key]
+                        aux_data_tensor = kwargs.get(aux_data_key, None)
+                        aux_data_lengths = kwargs.get(aux_data_key + "_lengths", None)
+
+                        if aux_data_tensor is not None and aux_data_lengths is not None:
+                            loss_ic, cer_ic = self._calc_ctc_loss(
+                                intermediate_out,
+                                encoder_out_lens,
+                                aux_data_tensor,
+                                aux_data_lengths,
+                            )
+                        else:
+                            raise Exception(
+                                "Aux. CTC tasks were specified but no data was found"
+                            )
+                if loss_ic is None:
+                    loss_ic, cer_ic = self._calc_ctc_loss(
+                        intermediate_out, encoder_out_lens, text, text_lengths
+                    )
+                loss_interctc = loss_interctc + loss_ic
+
+                # Collect Intermediate CTC stats
+                stats["loss_interctc_layer{}".format(layer_idx)] = (
+                    loss_ic.detach() if loss_ic is not None else None
+                )
+                stats["cer_interctc_layer{}".format(layer_idx)] = cer_ic
+
+            loss_interctc = loss_interctc / len(intermediate_outs)
+
+            # calculate whole encoder loss
+            loss_ctc = (
+                1 - self.interctc_weight
+            ) * loss_ctc + self.interctc_weight * loss_interctc
+
+        if self.use_transducer_decoder:
+            # 2a. Transducer decoder branch
+            (
+                loss_transducer,
+                cer_transducer,
+                wer_transducer,
+            ) = self._calc_transducer_loss(
+                encoder_out,
+                encoder_out_lens,
+                text,
+            )
+
+            if loss_ctc is not None:
+                loss = loss_transducer + (self.ctc_weight * loss_ctc)
+            else:
+                loss = loss_transducer
+
+            # Collect Transducer branch stats
+            stats["loss_transducer"] = (
+                loss_transducer.detach() if loss_transducer is not None else None
+            )
+            stats["cer_transducer"] = cer_transducer
+            stats["wer_transducer"] = wer_transducer
+
+        elif self.use_linear_decoder:
+            # 2b. Linear decoder branch for classification tasks
+            loss, acc = self._calc_classif_loss(encoder_out, encoder_out_lens, text)
+            stats["loss"] = loss
+            stats["acc"] = acc
+        else:
+            # 2c. Attention decoder branch with optional disfluency detection
+            if self.ctc_weight != 1.0:
+                if self.use_disfluency_decoder and isdysfl is not None:
+                    # Joint ASR and disfluency detection
+                    (loss_att, acc_att, cer_att, wer_att, 
+                     loss_disfluency, acc_disfluency) = self._calc_att_disfluency_loss(
+                        encoder_out, encoder_out_lens, text, text_lengths, 
+                        isdysfl, isdysfl_lengths
+                    )
+                else:
+                    # Standard ASR only
+                    loss_att, acc_att, cer_att, wer_att = self._calc_att_loss(
+                        encoder_out, encoder_out_lens, text, text_lengths
+                    )
+
+            # 3. CTC-Att loss definition with disfluency
+            if self.ctc_weight == 0.0:
+                loss = loss_att
+                if loss_disfluency is not None:
+                    loss = loss + self.disfluency_weight * loss_disfluency
+            elif self.ctc_weight == 1.0:
+                loss = loss_ctc
+            else:
+                loss = self.ctc_weight * loss_ctc + (1 - self.ctc_weight) * loss_att
+                if loss_disfluency is not None:
+                    loss = loss + self.disfluency_weight * loss_disfluency
+
+            # Collect Attn branch stats
+            stats["loss_att"] = loss_att.detach() if loss_att is not None else None
+            stats["acc"] = acc_att
+            stats["cer"] = cer_att
+            stats["wer"] = wer_att
+            
+            # Collect disfluency stats
+            if loss_disfluency is not None:
+                stats["loss_disfluency"] = loss_disfluency.detach()
+                stats["acc_disfluency"] = acc_disfluency
+
+        # Collect total loss stats
+        stats["loss"] = loss.detach()
+
+        # force_gatherable: to-device and to-tensor if scalar for DataParallel
+        loss, stats, weight = force_gatherable((loss, stats, batch_size), loss.device)
+        return loss, stats, weight
+
+    def _calc_att_disfluency_loss(
+        self,
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+        ys_pad: torch.Tensor,
+        ys_pad_lens: torch.Tensor,
+        isdysfl_pad: torch.Tensor,
+        isdysfl_pad_lens: torch.Tensor = None,
+    ):
+        """Calculate attention loss with disfluency detection."""
+        if hasattr(self, "lang_token_id") and self.lang_token_id is not None:
+            ys_pad = torch.cat(
+                [
+                    self.lang_token_id.repeat(ys_pad.size(0), 1).to(ys_pad.device),
+                    ys_pad,
+                ],
+                dim=1,
+            )
+            ys_pad_lens += 1
+            # Also extend disfluency labels
+            isdysfl_pad = torch.cat(
+                [
+                    torch.zeros(isdysfl_pad.size(0), 1, dtype=isdysfl_pad.dtype, device=isdysfl_pad.device),
+                    isdysfl_pad,
+                ],
+                dim=1,
+            )
+
+        ys_in_pad, ys_out_pad = add_sos_eos(ys_pad, self.sos, self.eos, self.ignore_id)
+        ys_in_lens = ys_pad_lens + 1
+
+        # Add SOS/EOS to disfluency labels
+        # For disfluency, we use 0 (fluent) for SOS/EOS tokens
+        isdysfl_in_pad = torch.cat(
+            [
+                torch.zeros(isdysfl_pad.size(0), 1, dtype=isdysfl_pad.dtype, device=isdysfl_pad.device),
+                isdysfl_pad,
+            ],
+            dim=1,
+        )
+        isdysfl_out_pad = torch.cat(
+            [
+                isdysfl_pad,
+                torch.zeros(isdysfl_pad.size(0), 1, dtype=isdysfl_pad.dtype, device=isdysfl_pad.device),
+            ],
+            dim=1,
+        )
+
+        # 1. Forward decoder with disfluency detection
+        decoder_out = self.decoder(
+            encoder_out, encoder_out_lens, ys_in_pad, ys_in_lens, return_disfluency=True
+        )
+        
+        if isinstance(decoder_out, tuple) and len(decoder_out) == 2:
+            if isinstance(decoder_out[0], tuple):
+                # (asr_out, disfluency_out), olens
+                (asr_out, disfluency_out), olens = decoder_out
+            else:
+                # asr_out, olens (no disfluency)
+                asr_out, olens = decoder_out
+                disfluency_out = None
+        else:
+            # Standard output
+            asr_out, olens = decoder_out
+            disfluency_out = None
+
+        # 2. Compute attention loss
+        loss_att = self.criterion_att(asr_out, ys_out_pad)
+        acc_att = th_accuracy(
+            asr_out.view(-1, self.vocab_size),
+            ys_out_pad,
+            ignore_label=self.ignore_id,
+        )
+
+        # 3. Compute disfluency loss
+        loss_disfluency = None
+        acc_disfluency = None
+        if disfluency_out is not None:
+            loss_disfluency = self.criterion_disfluency(
+                disfluency_out.view(-1, self.disfluency_classes),
+                isdysfl_out_pad.view(-1)
+            )
+            acc_disfluency = th_accuracy(
+                disfluency_out.view(-1, self.disfluency_classes),
+                isdysfl_out_pad,
+                ignore_label=self.ignore_id,
+            )
+
+        # Compute cer/wer using attention-decoder
+        if self.training or self.error_calculator is None:
+            cer_att, wer_att = None, None
+        else:
+            ys_hat = asr_out.argmax(dim=-1)
+            cer_att, wer_att = self.error_calculator(ys_hat.cpu(), ys_pad.cpu())
+
+        return loss_att, acc_att, cer_att, wer_att, loss_disfluency, acc_disfluency
+
+    def nll(
+        self,
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+        ys_pad: torch.Tensor,
+        ys_pad_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute negative log likelihood(nll) from transformer-decoder with disfluency support"""
+        ys_in_pad, ys_out_pad = add_sos_eos(ys_pad, self.sos, self.eos, self.ignore_id)
+        ys_in_lens = ys_pad_lens + 1
+
+        # 1. Forward decoder
+        if self.use_disfluency_decoder:
+            decoder_out = self.decoder(
+                encoder_out, encoder_out_lens, ys_in_pad, ys_in_lens, return_disfluency=False
+            )
+        else:
+            decoder_out = self.decoder(
+                encoder_out, encoder_out_lens, ys_in_pad, ys_in_lens
+            )
+        
+        if isinstance(decoder_out, tuple):
+            decoder_out = decoder_out[0]  # Take only ASR output
+            
+        batch_size = decoder_out.size(0)
+        decoder_num_class = decoder_out.size(2)
+        # nll: negative log-likelihood
+        nll = torch.nn.functional.cross_entropy(
+            decoder_out.view(-1, decoder_num_class),
+            ys_out_pad.view(-1),
+            ignore_index=self.ignore_id,
+            reduction="none",
+        )
+        nll = nll.view(batch_size, -1)
+        nll = nll.sum(dim=1)
+        assert nll.size(0) == batch_size
+        return nll
+    
+    def recognize_disfluency(
+        self,
+        speech: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        device: torch.device = torch.device("cpu"),
+    ):
+        """推論時にASRトークン列とdisfluency予測ラベル列を返す"""
+        self.eval()
+        with torch.no_grad():
+            # 1. エンコード
+            encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
+            # 2. デコーダ推論
+            # ここではgreedyデコード例（ビームサーチ等の場合は適宜修正）
+            ys_in_pad = torch.full((1, 1), self.sos, dtype=torch.long, device=device)
+            ys_in_lens = torch.tensor([1], dtype=torch.long, device=device)
+            hyp_tokens = []
+            hyp_disfluency = []
+            max_len = 512  # 適宜調整
+            for _ in range(max_len):
+                decoder_out = self.decoder(
+                    encoder_out, encoder_out_lens, ys_in_pad, ys_in_lens, return_disfluency=True
+                )
+                if isinstance(decoder_out, tuple) and len(decoder_out) == 2:
+                    (asr_out, disfluency_out), olens = decoder_out
+                else:
+                    asr_out, olens = decoder_out
+                    disfluency_out = None
+                # トークン予測
+                next_token = asr_out[:, -1, :].argmax(dim=-1)
+                hyp_tokens.append(next_token.item())
+                # disfluency予測
+                if disfluency_out is not None:
+                    next_disfl = disfluency_out[:, -1, :].argmax(dim=-1)
+                    hyp_disfluency.append(next_disfl.item())
+                # 終端
+                if next_token.item() == self.eos:
+                    break
+                ys_in_pad = torch.cat([ys_in_pad, next_token.unsqueeze(1)], dim=1)
+                ys_in_lens += 1
+            return hyp_tokens, hyp_disfluency
+        
+    def decode_with_disfluency(
+        self,
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+        beam_search,
+        device: torch.device = torch.device("cpu"),
+    ):
+        """ビームサーチ推論でdisfluency_scoresをHypothesisに格納"""
+        nbest_hyps = beam_search(
+            x=encoder_out[0], maxlenratio=0.0, minlenratio=0.0
+        )
+        results = []
+        for hyp in nbest_hyps:
+            # トークン列
+            if isinstance(hyp.yseq, list):
+                token_int = hyp.yseq[1:-1]
+            else:
+                token_int = hyp.yseq[1:-1].tolist()
+            # デコーダでdisfluency出力を取得
+            ys_in_pad = torch.tensor([[self.sos] + token_int], dtype=torch.long, device=device)
+            ys_in_lens = torch.tensor([len(token_int) + 1], dtype=torch.long, device=device)
+            decoder_out = self.decoder(
+                encoder_out, encoder_out_lens, ys_in_pad, ys_in_lens, return_disfluency=True
+            )
+            if isinstance(decoder_out, tuple) and len(decoder_out) == 2:
+                (asr_out, disfluency_out), olens = decoder_out
+            else:
+                asr_out, olens = decoder_out
+                disfluency_out = None
+            if disfluency_out is not None:
+                disfluency_preds = disfluency_out.argmax(dim=-1)[0, 1:].cpu().tolist()
+            else:
+                disfluency_preds = None
+
+            # statesフィールドにdisfluency_scoresを追加
+            new_states = dict(hyp.states) if hasattr(hyp, "states") else {}
+            new_states["disfluency_scores"] = disfluency_preds
+            hyp = hyp._replace(states=new_states)
+            results.append(hyp)
+        return results

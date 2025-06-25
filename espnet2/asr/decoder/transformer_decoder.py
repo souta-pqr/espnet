@@ -955,3 +955,438 @@ class TransformerMDDecoder(BaseTransformerDecoder):
         # transpose state of [layer, batch] into [batch, layer]
         state_list = [[states[i][b] for i in range(n_layers)] for b in range(n_batch)]
         return logp, state_list
+
+
+class DisfluencyTransformerDecoder(BaseTransformerDecoder):
+    """Transformer decoder with disfluency detection capability.
+    
+    This decoder jointly performs ASR token prediction and disfluency detection
+    with a token-dependency mechanism as described in:
+    "Streaming Joint Speech Recognition and Disfluency Detection"
+    
+    Args:
+        vocab_size: output dim for ASR tokens
+        encoder_output_size: dimension of attention
+        attention_heads: the number of heads of multi head attention
+        linear_units: the number of units of position-wise feed forward
+        num_blocks: the number of decoder blocks
+        dropout_rate: dropout rate
+        positional_dropout_rate: positional encoding dropout rate
+        self_attention_dropout_rate: dropout rate for self attention
+        src_attention_dropout_rate: dropout rate for src attention
+        input_layer: input layer type
+        use_output_layer: whether to use output layer
+        pos_enc_class: PositionalEncoding or ScaledPositionalEncoding
+        normalize_before: whether to use layer_norm before the first block
+        concat_after: whether to concat attention layer's input and output
+        layer_drop_rate: layer drop rate
+        qk_norm: whether to use qk normalization
+        use_flash_attn: whether to use flash attention
+        gradient_checkpoint_layers: layers to use gradient checkpointing
+        disfluency_classes: number of disfluency classes (default: 4)
+            0: fluent, 1: filler, 2: repetition, 3: interjection
+        disfluency_weight: weight for disfluency loss (default: 1.0)
+    """
+
+    @typechecked
+    def __init__(
+        self,
+        vocab_size: int,
+        encoder_output_size: int,
+        attention_heads: int = 4,
+        linear_units: int = 2048,
+        num_blocks: int = 6,
+        dropout_rate: float = 0.1,
+        positional_dropout_rate: float = 0.1,
+        self_attention_dropout_rate: float = 0.0,
+        src_attention_dropout_rate: float = 0.0,
+        input_layer: str = "embed",
+        use_output_layer: bool = True,
+        pos_enc_class=PositionalEncoding,
+        normalize_before: bool = True,
+        concat_after: bool = False,
+        layer_drop_rate: float = 0.0,
+        qk_norm: bool = False,
+        use_flash_attn: bool = True,
+        gradient_checkpoint_layers: List[int] = [],
+        disfluency_classes: int = 4,
+        disfluency_weight: float = 1.0,
+    ):
+        super().__init__(
+            vocab_size=vocab_size,
+            encoder_output_size=encoder_output_size,
+            dropout_rate=dropout_rate,
+            positional_dropout_rate=positional_dropout_rate,
+            input_layer=input_layer,
+            use_output_layer=use_output_layer,
+            pos_enc_class=pos_enc_class,
+            normalize_before=normalize_before,
+            gradient_checkpoint_layers=gradient_checkpoint_layers,
+        )
+
+        if use_flash_attn:
+            try:
+                from espnet2.torch_utils.get_flash_attn_compatability import (
+                    is_flash_attn_supported,
+                )
+
+                use_flash_attn = is_flash_attn_supported()
+                import flash_attn  # noqa
+            except Exception:
+                use_flash_attn = False
+
+        attention_dim = encoder_output_size
+        self.disfluency_classes = disfluency_classes
+        self.disfluency_weight = disfluency_weight
+        
+        # Standard transformer decoder layers
+        self.decoders = repeat(
+            num_blocks,
+            lambda lnum: DecoderLayer(
+                attention_dim,
+                MultiHeadedAttention(
+                    attention_heads,
+                    attention_dim,
+                    self_attention_dropout_rate,
+                    qk_norm,
+                    use_flash_attn,
+                    True,
+                    False,
+                ),
+                MultiHeadedAttention(
+                    attention_heads,
+                    attention_dim,
+                    src_attention_dropout_rate,
+                    qk_norm,
+                    use_flash_attn,
+                    False,
+                    True,
+                ),
+                PositionwiseFeedForward(attention_dim, linear_units, dropout_rate),
+                dropout_rate,
+                normalize_before,
+                concat_after,
+            ),
+            layer_drop_rate,
+        )
+        
+        # Disfluency detection output layer
+        # Token-dependency mechanism: concatenate token embedding and hidden state
+        self.disfluency_output_layer = torch.nn.Linear(
+            attention_dim + attention_dim,  # hidden_state + token_embedding
+            disfluency_classes
+        )
+        
+        # Token embedding layer for token-dependency mechanism
+        self.token_embedding = torch.nn.Embedding(vocab_size, attention_dim)
+
+    def forward(
+        self,
+        hs_pad: torch.Tensor,
+        hlens: torch.Tensor,
+        ys_in_pad: torch.Tensor,
+        ys_in_lens: torch.Tensor,
+        return_hs: bool = False,
+        return_all_hs: bool = False,
+        return_disfluency: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward decoder with disfluency detection.
+
+        Args:
+            hs_pad: encoded memory, float32  (batch, maxlen_in, feat)
+            hlens: (batch)
+            ys_in_pad: input token ids, int64 (batch, maxlen_out)
+            ys_in_lens: (batch)
+            return_hs: whether to return the last hidden output before output layer
+            return_all_hs: whether to return all hidden intermediates
+            return_disfluency: whether to return disfluency predictions
+
+        Returns:
+            (tuple): tuple containing:
+            asr_out: decoded token score before softmax (batch, maxlen_out, vocab_size)
+            disfluency_out: disfluency scores (batch, maxlen_out, disfluency_classes)
+            olens: (batch, )
+        """
+        tgt = ys_in_pad
+        # tgt_mask: (B, 1, L)
+        tgt_mask = (~make_pad_mask(ys_in_lens)[:, None, :]).to(tgt.device)
+        # m: (1, L, L)
+        m = subsequent_mask(tgt_mask.size(-1), device=tgt_mask.device).unsqueeze(0)
+        # tgt_mask: (B, L, L)
+        tgt_mask = tgt_mask & m
+
+        memory = hs_pad
+        memory_mask = (~make_pad_mask(hlens, maxlen=memory.size(1)))[:, None, :].to(
+            memory.device
+        )
+        # Padding for Longformer
+        if memory_mask.shape[-1] != memory.shape[1]:
+            padlen = memory.shape[1] - memory_mask.shape[-1]
+            memory_mask = torch.nn.functional.pad(
+                memory_mask, (0, padlen), "constant", False
+            )
+
+        x = self.embed(tgt)
+        intermediate_outs = []
+        for layer_idx, decoder_layer in enumerate(self.decoders):
+            if layer_idx + 1 in self.gradient_checkpoint_layers:
+                x, tgt_mask, memory, memory_mask = torch.utils.checkpoint.checkpoint(
+                    decoder_layer, x, tgt_mask, memory, memory_mask, use_reentrant=False
+                )
+            else:
+                x, tgt_mask, memory, memory_mask = decoder_layer(
+                    x, tgt_mask, memory, memory_mask
+                )
+            if return_all_hs:
+                intermediate_outs.append(x)
+                
+        if self.normalize_before:
+            x = self.after_norm(x)
+            
+        hidden_states = x  # Store hidden states for disfluency prediction
+        
+        if return_hs:
+            hidden = x
+            
+        # ASR token prediction
+        asr_out = None
+        if self.output_layer is not None:
+            asr_out = self.output_layer(x)
+        
+        # Disfluency prediction with token-dependency mechanism
+        disfluency_out = None
+        if return_disfluency and asr_out is not None:
+            # Get predicted tokens (for teacher forcing during training)
+            # During training, use target tokens; during inference, use predicted tokens
+            if self.training:
+                # Use target tokens (teacher forcing)
+                target_tokens = ys_in_pad
+            else:
+                # Use predicted tokens
+                target_tokens = asr_out.argmax(dim=-1)
+            
+            # Token-dependency mechanism: p(di|X, y≤i, d<i) = softmax(W[E(yi); si] + b)
+            token_embeddings = self.token_embedding(target_tokens)  # (B, L, D)
+            
+            # Concatenate token embeddings and hidden states
+            disfluency_input = torch.cat([token_embeddings, hidden_states], dim=-1)  # (B, L, 2*D)
+            
+            # Predict disfluency scores
+            disfluency_out = self.disfluency_output_layer(disfluency_input)  # (B, L, disfluency_classes)
+
+        olens = tgt_mask.sum(1)
+        
+        if return_disfluency and disfluency_out is not None:
+            if return_hs:
+                return (asr_out, disfluency_out, hidden), olens
+            elif return_all_hs:
+                return (asr_out, disfluency_out, intermediate_outs), olens
+            else:
+                return (asr_out, disfluency_out), olens
+        else:
+            if return_hs:
+                return (asr_out, hidden), olens
+            elif return_all_hs:
+                return (asr_out, intermediate_outs), olens
+            return asr_out, olens
+
+    def forward_one_step(
+        self,
+        tgt: torch.Tensor,
+        tgt_mask: torch.Tensor,
+        memory: torch.Tensor,
+        memory_mask: torch.Tensor = None,
+        *,
+        cache: List[torch.Tensor] = None,
+        return_hs: bool = False,
+        return_disfluency: bool = True,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Forward one step with disfluency detection.
+
+        Args:
+            tgt: input token ids, int64 (batch, maxlen_out)
+            tgt_mask: input token mask
+            memory: encoded memory, float32  (batch, maxlen_in, feat)
+            memory_mask: encoded memory mask (batch, 1, maxlen_in)
+            cache: cached output list
+            return_hs: whether to return hidden states
+            return_disfluency: whether to return disfluency predictions
+
+        Returns:
+            y: NN output value
+            disfluency_y: disfluency predictions (if return_disfluency=True)
+            cache: cache per self.decoders
+        """
+        x = self.embed(tgt)
+        if cache is None:
+            cache = [None] * len(self.decoders)
+        new_cache = []
+        for c, decoder in zip(cache, self.decoders):
+            x, tgt_mask, memory, memory_mask = decoder(
+                x, tgt_mask, memory, memory_mask, cache=c
+            )
+            new_cache.append(x)
+
+        if self.normalize_before:
+            y = self.after_norm(x[:, -1])
+        else:
+            y = x[:, -1]
+            
+        hidden_state = y  # Store for disfluency prediction
+        
+        if return_hs:
+            hidden = y
+            
+        # ASR token prediction
+        asr_y = None
+        if self.output_layer is not None:
+            asr_y = torch.log_softmax(self.output_layer(y), dim=-1)
+        
+        # Disfluency prediction
+        disfluency_y = None
+        if return_disfluency and asr_y is not None:
+            # Get the predicted token for the current step
+            predicted_token = asr_y.argmax(dim=-1)  # (batch,)
+            
+            # Token embedding for current predicted token
+            token_emb = self.token_embedding(predicted_token)  # (batch, D)
+            
+            # Token-dependency mechanism
+            disfluency_input = torch.cat([token_emb, hidden_state], dim=-1)  # (batch, 2*D)
+            disfluency_y = torch.log_softmax(self.disfluency_output_layer(disfluency_input), dim=-1)
+
+        if return_disfluency and disfluency_y is not None:
+            if return_hs:
+                return (asr_y, disfluency_y, hidden), new_cache
+            else:
+                return (asr_y, disfluency_y), new_cache
+        else:
+            if return_hs:
+                return (asr_y, hidden), new_cache
+            return asr_y, new_cache
+
+    def score(self, ys, state, x, return_hs=False, return_disfluency=True):
+        """Score with disfluency detection."""
+        ys_mask = subsequent_mask(len(ys), device=x.device).unsqueeze(0)
+        
+        if return_disfluency:
+            if return_hs:
+                (logp, disfluency_logp, hs), state = self.forward_one_step(
+                    ys.unsqueeze(0),
+                    ys_mask,
+                    x.unsqueeze(0),
+                    cache=state,
+                    return_hs=return_hs,
+                    return_disfluency=return_disfluency,
+                )
+                return (logp.squeeze(0), disfluency_logp.squeeze(0)), hs, state
+            else:
+                (logp, disfluency_logp), state = self.forward_one_step(
+                    ys.unsqueeze(0),
+                    ys_mask,
+                    x.unsqueeze(0),
+                    cache=state,
+                    return_hs=return_hs,
+                    return_disfluency=return_disfluency,
+                )
+                return (logp.squeeze(0), disfluency_logp.squeeze(0)), state
+        else:
+            if return_hs:
+                (logp, hs), state = self.forward_one_step(
+                    ys.unsqueeze(0),
+                    ys_mask,
+                    x.unsqueeze(0),
+                    cache=state,
+                    return_hs=return_hs,
+                    return_disfluency=return_disfluency,
+                )
+                return logp.squeeze(0), hs, state
+            else:
+                logp, state = self.forward_one_step(
+                    ys.unsqueeze(0),
+                    ys_mask,
+                    x.unsqueeze(0),
+                    cache=state,
+                    return_hs=return_hs,
+                    return_disfluency=return_disfluency,
+                )
+                return logp.squeeze(0), state
+
+    def batch_score(
+        self,
+        ys: torch.Tensor,
+        states: List[Any],
+        xs: torch.Tensor,
+        return_hs: bool = False,
+        return_disfluency: bool = True,
+    ) -> Tuple[torch.Tensor, List[Any]]:
+        """Score new token batch with disfluency detection."""
+        # merge states
+        n_batch = len(ys)
+        n_layers = len(self.decoders)
+        if states[0] is None:
+            batch_state = None
+        else:
+            # transpose state of [batch, layer] into [layer, batch]
+            batch_state = [
+                torch.stack([states[b][i] for b in range(n_batch)])
+                for i in range(n_layers)
+            ]
+
+        # batch decoding
+        ys_mask = subsequent_mask(ys.size(-1), device=xs.device).unsqueeze(0)
+        
+        if return_disfluency:
+            if return_hs:
+                (logp, disfluency_logp, hs), states = self.forward_one_step(
+                    ys, ys_mask, xs, cache=batch_state, 
+                    return_hs=return_hs, return_disfluency=return_disfluency
+                )
+            else:
+                (logp, disfluency_logp), states = self.forward_one_step(
+                    ys, ys_mask, xs, cache=batch_state, 
+                    return_hs=return_hs, return_disfluency=return_disfluency
+                )
+        else:
+            if return_hs:
+                (logp, hs), states = self.forward_one_step(
+                    ys, ys_mask, xs, cache=batch_state, 
+                    return_hs=return_hs, return_disfluency=return_disfluency
+                )
+            else:
+                logp, states = self.forward_one_step(
+                    ys, ys_mask, xs, cache=batch_state, 
+                    return_hs=return_hs, return_disfluency=return_disfluency
+                )
+
+        # transpose state of [layer, batch] into [batch, layer]
+        state_list = [[states[i][b] for i in range(n_layers)] for b in range(n_batch)]
+        
+        if return_disfluency:
+            if return_hs:
+                return (logp, disfluency_logp, hs), state_list
+            else:
+                return (logp, disfluency_logp), state_list
+        else:
+            if return_hs:
+                return (logp, hs), state_list
+            return logp, state_list
+        
+    def recognize_disfluency(
+        self,
+        hs_pad: torch.Tensor,
+        hlens: torch.Tensor,
+        ys_in_pad: torch.Tensor,
+        ys_in_lens: torch.Tensor,
+    ):
+        """推論時にdisfluency予測ラベル列を返すユーティリティ"""
+        self.eval()
+        with torch.no_grad():
+            # ASRトークン予測
+            (asr_out, disfluency_out), olens = self.forward(
+                hs_pad, hlens, ys_in_pad, ys_in_lens, return_disfluency=True
+            )
+            # asr_out: (B, L, vocab_size), disfluency_out: (B, L, disfluency_classes)
+            # トークンごとに最大値のインデックスを取得
+            disfluency_preds = disfluency_out.argmax(dim=-1)  # (B, L)
+            return disfluency_preds
