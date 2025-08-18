@@ -12,7 +12,7 @@ test_sets="eval"
 asr_config=myconf/train_asr_streaming_conformer_multitask.yaml
 inference_config=myconf/decode_asr_streaming.yaml
 
-asr_tag=0622_multitask_transformer_+csj_hatuon
+asr_tag=0720_multitask_transformer_CSJ_shoji
 
 # LM settings
 lm_config=conf/train_lm.yaml
