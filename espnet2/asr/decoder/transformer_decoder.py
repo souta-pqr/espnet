@@ -1069,16 +1069,16 @@ class DisfluencyTransformerDecoder(BaseTransformerDecoder):
             ),
             layer_drop_rate,
         )
-        
-        # Disfluency detection output layer
+
+        # Add disfluency embedding (4 classes)
+        self.disfluency_embedding = torch.nn.Embedding(self.disfluency_classes, attention_dim)
+        # Token embedding layer for token-dependency mechanism
+        self.token_embedding = torch.nn.Embedding(vocab_size, attention_dim)
         # Token-dependency mechanism: concatenate token embedding and hidden state
         self.disfluency_output_layer = torch.nn.Linear(
             attention_dim + attention_dim,  # hidden_state + token_embedding
-            disfluency_classes
+            self.disfluency_classes
         )
-        
-        # Token embedding layer for token-dependency mechanism
-        self.token_embedding = torch.nn.Embedding(vocab_size, attention_dim)
 
     def forward(
         self,
@@ -1105,7 +1105,21 @@ class DisfluencyTransformerDecoder(BaseTransformerDecoder):
             (tuple): tuple containing:
             asr_out: decoded token score before softmax (batch, maxlen_out, vocab_size)
             disfluency_out: disfluency scores (batch, maxlen_out, disfluency_classes)
-            olens: (batch, )
+                # Use token embedding and disfluency embedding summed as input
+                # During training, use ground-truth disfluency labels; during inference, use predicted labels (here, assume training)
+                if hasattr(self, 'disfluency_embedding'):
+                    # If training, use ground-truth disfluency labels (ys_in_disfluency)
+                    if self.training and hasattr(self, 'ys_in_disfluency'):
+                        disfluency_ids = self.ys_in_disfluency
+                    else:
+                        # If not available, use zeros (fluent)
+                        disfluency_ids = torch.zeros_like(tgt)
+                    token_emb = self.token_embedding(tgt)
+                    disfluency_emb = self.disfluency_embedding(disfluency_ids)
+                    x = token_emb + disfluency_emb
+                    x = self.embed[1](x)  # positional encoding
+                else:
+                    x = self.embed(tgt)
         """
         tgt = ys_in_pad
         # tgt_mask: (B, 1, L)
